@@ -1,0 +1,23 @@
+# Dockerfile.python — Producer & Consumer image
+# Uses Python 3.11-slim (has pre-built wheels for all dependencies)
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps needed by confluent-kafka's librdkafka at runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libssl-dev \
+    libsasl2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps first (layer-cached unless requirements.txt changes)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Code is mounted as a volume at runtime (./kafka → /app)
+# so we don't COPY it here — keeps the image reusable for both
+# producer and consumer without a rebuild on every code change.
+
+CMD ["python", "--version"]
