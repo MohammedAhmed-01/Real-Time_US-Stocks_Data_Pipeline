@@ -26,6 +26,9 @@
 ## 📋 Table of Contents
 
 - [📋 Table of Contents](#-table-of-contents)
+- [🆕 Changelog](#-changelog)
+  - [`producer.py` — fixed a slow-download stall caused by missing tickers (2026-09-09)](#producerpy--fixed-a-slow-download-stall-caused-by-missing-tickers-2026-09-09)
+- [🧭 Getting Started on a New Machine — What You MUST Check/Change](#-getting-started-on-a-new-machine--what-you-must-checkchange)
 - [🔍 Overview](#-overview)
 - [🏗 Architecture](#-architecture)
   - [Data Flow](#data-flow)
@@ -37,6 +40,7 @@
   - [`us-stocks-dead-letter` — Failed Events](#us-stocks-dead-letter--failed-events)
 - [🗂 Event Schema](#-event-schema)
   - [Field Reference](#field-reference)
+- [🧾 What is Stock\_List.csv and how is it used?](#-what-is-stock_listcsv-and-how-is-it-used)
 - [🧰 Prerequisites](#-prerequisites)
 - [🚀 Quick Start](#-quick-start)
   - [1 — Clone \& configure](#1--clone--configure)
@@ -56,6 +60,7 @@
   - [Speed Control](#speed-control)
   - [Kafka Producer Settings](#kafka-producer-settings)
   - [Dataset Source](#dataset-source)
+  - [Handling missing tickers (404s) — not a bug](#handling-missing-tickers-404s--not-a-bug)
 - [📥 Consumer / Validator Details](#-consumer--validator-details)
   - [Kafka Consumer Settings](#kafka-consumer-settings)
 - [👥 Consumer Groups](#-consumer-groups)
@@ -69,6 +74,60 @@
   - [Step 3 — Connect to Kafka and Read the Stream](#step-3--connect-to-kafka-and-read-the-stream)
   - [Spark ↔ Kafka Connection Reference](#spark--kafka-connection-reference)
 - [🐛 Troubleshooting](#-troubleshooting)
+
+---
+
+## 🆕 Changelog
+
+### `producer.py` — fixed a slow-download stall caused by missing tickers (2026-09-09)
+
+**Symptom:** the producer would appear to "hang" for minutes at a time on certain
+tickers (e.g. `AACBR`, `AACIU`), logging repeated lines like:
+
+```
+[DL] REST attempt 7/10 failed for Data/StockHistory/AACIU.csv: 404 Client Error: Not Found
+[DL] Retrying Data/StockHistory/AACIU.csv in 30 s …
+```
+
+**Root cause:** `Stock_List.csv` contains a broader universe of ticker symbols than
+what actually exists as files in the Kaggle dataset
+(`footballjoe789/us-stock-dataset`). When a symbol has no corresponding CSV in the
+dataset, Kaggle correctly returns **HTTP 404**. The old code treated a 404 exactly
+like a transient failure (network blip, rate limit) and retried it **10 times**
+with a growing backoff (5s → 30s), wasting **2–5 minutes per missing ticker**.
+Across thousands of ticker/warrant/unit variants in `Stock_List.csv` that Kaggle
+doesn't have, this added up to a large chunk of wasted wall-clock time.
+
+**Fix:** added a `KaggleFileNotFound` exception. A 404 (from either the `kaggle`
+CLI or the REST fallback) is now treated as **permanent** and is skipped
+**immediately**, with a single `INFO`-level log line — no retries wasted. Genuine
+transient errors (HTTP 429 rate limits, timeouts, network errors) still retry
+with backoff exactly as before.
+
+- Skipped files are now split into `not_found_files` (404 — ticker doesn't exist
+  in the dataset) vs other `skipped_files` (empty file, missing required columns)
+  in the final producer summary, so you can tell the two apart.
+- No CLI flags, environment variables, or file locations changed — this is a
+  drop-in replacement for `kafka/producer.py`.
+
+---
+
+## 🧭 Getting Started on a New Machine — What You MUST Check/Change
+
+If you're cloning this repo onto a new machine (or handing it off to a
+teammate), these are the things that are **environment-specific** and will
+break silently if you don't check them:
+
+| # | What | Where | What to do |
+|---|---|---|---|
+| 1 | **Kaggle credentials** | `.env` (copy from `env.example`) | Replace `KAGGLE_USERNAME` / `KAGGLE_KEY` with your own — the values checked into `env.example` are placeholders and will not work for you. Get yours at <https://www.kaggle.com/settings> → API → Create New Token. |
+| 2 | **`.env` is real secrets — don't commit it** | repo root | `.env` is loaded by both `producer.py` and `consumer.py` via `python-dotenv`. Never commit your real `.env`; only `env.example` should be tracked. |
+| 3 | **`Stock_List.csv` path** | repo root **and** `kafka/Stock_List.csv` | The producer looks for the ticker list at `/app/Stock_List.csv` **inside the container**, which Docker Compose provides via the `./kafka:/app` volume mount — so the file must physically live at `kafka/Stock_List.csv` on your host. If you're running the producer **outside Docker**, pass the path explicitly: `python kafka/producer.py --stock-list kafka/Stock_List.csv` (or wherever your copy lives). See [What is Stock_List.csv](#-what-is-stock_listcsv-and-how-is-it-used) below. |
+| 4 | **Kafka bootstrap address** | `.env` → `KAFKA_BOOTSTRAP` | Inside Docker (`docker compose up`), this is auto-injected as `kafka-1:29092,kafka-2:29093,kafka-3:29094` — you don't need to touch it. Running the producer/consumer **from your host machine** instead, use `localhost:9092,localhost:9093,localhost:9094`. |
+| 5 | **Host ports free** | `docker-compose.yml` | `8080` (Kafka UI), `9092`/`9093`/`9094` (brokers). If any are already in use on your machine, either stop the conflicting service or change the host-side port mapping in `docker-compose.yml`. |
+| 6 | **Docker resources** | Docker Desktop → Settings → Resources | Allocate **at least 8 GB RAM** — three Kafka brokers are memory-hungry and will restart/crash-loop if starved. |
+| 7 | **`producer.py` code changes are picked up without rebuilding the image** | `docker-compose.yml` | The `./kafka:/app` volume mount means edits to `producer.py` / `consumer.py` take effect on the next `docker compose up -d --force-recreate producer` — you do **not** need `--build` unless you changed `requirements.txt` or `Dockerfile.python`. |
+| 8 | **Expect some 404s from Kaggle — this is normal** | producer logs | `Stock_List.csv` is a broader ticker universe than the Kaggle dataset actually contains. You'll see `[DL] ... not in dataset — skipping (no retries).` for some symbols — that's expected (see the Changelog above) and not something to "fix". |
 
 ---
 
@@ -128,9 +187,14 @@ The pipeline is structured across milestones. This repository covers **M1 — Da
 ### Data Flow
 
 ```
-Kaggle Dataset
+Stock_List.csv (ticker universe)
     │
-    │  kaggle CLI / REST API
+    │  build_file_list_from_csv()
+    ▼
+Kaggle Dataset (footballjoe789/us-stock-dataset)
+    │
+    │  kaggle CLI / REST API  — 404s from tickers not in the dataset
+    │  are skipped immediately (KaggleFileNotFound), no retries wasted
     ▼
 Download Thread  ──[queue]──►  Main Thread (Producer)
                                     │
@@ -160,11 +224,20 @@ Download Thread  ──[queue]──►  Main Thread (Producer)
 ├── requirements.txt          # Python dependencies
 ├── .env                      # Your secrets — NEVER commit this file
 ├── env.example               # Template — copy to .env and fill in your values
+├── Stock_List.csv            # (repo root copy, if kept here) ticker universe — see below
 └── kafka/
     ├── producer.py           # Kaggle → Kafka streaming producer
     ├── consumer.py           # Validating micro-batch consumer
-    └── topic_config.py       # Single source of truth: topic specs & event schema
+    ├── topic_config.py       # Single source of truth: topic specs & event schema
+    └── Stock_List.csv        # ← the copy actually mounted into the containers (./kafka:/app)
 ```
+
+> ⚠️ Note there are two copies of `Stock_List.csv` in this repo (root and
+> `kafka/`). The one that matters at runtime is **`kafka/Stock_List.csv`**,
+> because that's the directory Docker Compose mounts to `/app` inside the
+> producer container. If you update your ticker list, update
+> **`kafka/Stock_List.csv`** (and keep the root copy in sync if you want a
+> reference outside Docker).
 
 ---
 
@@ -275,6 +348,55 @@ Every message on `us-stocks-raw` is a UTF-8 encoded JSON object. The Kafka messa
 
 ---
 
+## 🧾 What is Stock_List.csv and how is it used?
+
+`Stock_List.csv` is a **single-column CSV** (header `Symbol`) listing the
+universe of US stock ticker symbols the producer will attempt to stream —
+currently ~6,600 symbols, covering common stock, ETFs, warrants (`...W`),
+units (`...U`), and other share-class variants.
+
+**Why it exists:** the Kaggle dataset (`footballjoe789/us-stock-dataset`)
+doesn't expose a reliable, paginated way to list every file it contains.
+Instead of querying Kaggle's file listing API (slow and unreliable at this
+scale), `producer.py`:
+
+1. Reads every symbol from `Stock_List.csv` via `build_file_list_from_csv()`.
+2. Builds the expected Kaggle path for each one:
+   `Data/StockHistory/<SYMBOL>.csv`
+3. Hands that full list to the download thread, which fetches each file
+   from Kaggle (CLI first, REST fallback second) and pushes the resulting
+   DataFrame onto a queue for the main thread to stream into Kafka.
+
+**Important caveat:** `Stock_List.csv` is a *broader* ticker universe than
+what Kaggle's dataset actually contains. Some symbols in the list — often
+warrant/unit/rights variants like `AACBR`, `AACIU`, `AAPG` — have **no
+matching file** in the dataset and will 404 when requested. As of the fix
+above, this is handled gracefully: the producer logs it once at `INFO`
+level and moves on immediately, it does **not** retry or crash.
+
+**Where the file lives / which copy is used:**
+- `kafka/Stock_List.csv` — this is the one that matters. It's mounted into
+  the producer container at `/app/Stock_List.csv` via the `./kafka:/app`
+  volume in `docker-compose.yml`, which is the producer's default
+  `--stock-list` path.
+- `Stock_List.csv` (repo root) — a convenience copy for reference /
+  running outside Docker from the repo root.
+
+**To use a different or filtered ticker list:**
+```bash
+# Docker: edit kafka/Stock_List.csv directly, then recreate the container
+docker compose up -d --force-recreate producer
+
+# Local (outside Docker): point at any CSV with a Symbol/Ticker column
+python kafka/producer.py --stock-list path/to/my_tickers.csv
+```
+
+The CSV loader (`build_file_list_from_csv`) also accepts `symbol`,
+`Ticker`, or `ticker` as the column header, or falls back to the first
+column if none of those match.
+
+---
+
 ## 🧰 Prerequisites
 
 | Requirement | Version | Notes |
@@ -304,12 +426,16 @@ cd <repo-directory>
 cp env.example .env
 ```
 
-Open `.env` and fill in your Kaggle credentials:
+Open `.env` and fill in your **own** Kaggle credentials (the values in
+`env.example` are placeholders and will not work):
 
 ```env
 KAGGLE_USERNAME=your_kaggle_username
 KAGGLE_KEY=your_kaggle_api_key
 ```
+
+Also confirm `kafka/Stock_List.csv` exists — it's required by the producer
+(see [What is Stock_List.csv](#-what-is-stock_listcsv-and-how-is-it-used)).
 
 ### 2 — Start the full stack
 
@@ -403,20 +529,22 @@ docker compose down -v
 ```bash
 pip install -r requirements.txt
 
-# Stream all stocks at 5× speed, 50-row micro-batches
-python kafka/producer.py --speed 5 --batch-size 50
+# Default: reads kafka/Stock_List.csv is NOT the default outside Docker —
+# you must point at it explicitly (the /app/Stock_List.csv default only
+# applies inside the container).
+python kafka/producer.py --stock-list kafka/Stock_List.csv
 
 # Stream only one ticker symbol
-python kafka/producer.py --ticker AAPL --speed 1
+python kafka/producer.py --stock-list kafka/Stock_List.csv --ticker AAPL --rows-per-sec 1
 
 # Override the target topic
-python kafka/producer.py --topic my-topic --speed 10
+python kafka/producer.py --stock-list kafka/Stock_List.csv --topic my-topic --rows-per-sec 10
 ```
 
 ### Consumer — local (outside Docker)
 
 ```bash
-# Default settings (batch=100 messages, max-wait=2 s)
+# Default settings (batch=100 messages, max-wait=5 s, idle-timeout=120 s)
 python kafka/consumer.py
 
 # Print every valid message as it arrives
@@ -430,18 +558,19 @@ python kafka/consumer.py --batch-size 500 --max-wait-ms 1000
 
 | Flag | Default | Description |
 |---|---|---|
-| `--speed` | `1.0` | Replay speed multiplier (`5` = 5× faster than real-time) |
+| `--rows-per-sec` | `1.0` | Rows produced per second (controls replay speed) |
 | `--batch-size` | `50` | Rows per Kafka micro-batch |
 | `--ticker` | *(all tickers)* | Stream only this ticker symbol |
 | `--topic` | `us-stocks-raw` | Override the target Kafka topic |
+| `--stock-list` | `/app/Stock_List.csv` (Docker default) | Path to the ticker CSV. **Outside Docker, you must pass this explicitly** — e.g. `--stock-list kafka/Stock_List.csv`. |
 
 ### Consumer CLI Reference
 
 | Flag | Default | Description |
 |---|---|---|
 | `--batch-size` | `100` | Messages per processing batch (size trigger) |
-| `--max-wait-ms` | `2000` | Max milliseconds before a time-triggered flush |
-| `--timeout` | `0.5` | Kafka poll timeout in seconds |
+| `--max-wait-ms` | `5000` | Max milliseconds before a time-triggered flush |
+| `--idle-timeout` | `120` | Seconds all partitions must stay at EOF before the consumer exits |
 | `--group` | `m1-validation-group` | Override the consumer group ID |
 | `--topic` | `us-stocks-raw` | Override the source topic |
 | `--live` | off | Print every valid message individually as it arrives |
@@ -470,10 +599,10 @@ The producer runs in **steady real-time mode** using two coordinated threads:
 
 | Thread | Role |
 |---|---|
-| **Download thread** | Downloads CSV files from Kaggle one at a time; pushes `(filename, DataFrame)` pairs to an in-memory queue (max 5 files buffered). Retries each file up to 10 times with backoff before skipping. |
+| **Download thread** | Downloads CSV files from Kaggle one at a time (per the ticker list built from `Stock_List.csv`); pushes `(filename, DataFrame)` pairs to an in-memory queue (max 5 files buffered). Retries each *transient* failure up to 10 times with backoff; skips 404s (file not in dataset) immediately without retrying — see [Changelog](#-changelog). |
 | **Main thread** | Pops files from the queue, converts each row to a JSON event, and produces to Kafka at a precise controlled rate set by `--rows-per-sec`. |
 
-A `next_row_time` clock enforces the rate accurately at the individual row level — not per batch — so the pace is consistent even for small files. The producer **never stops early**; it runs until every file in the dataset has been fully streamed.
+A `next_row_time` clock enforces the rate accurately at the individual row level — not per batch — so the pace is consistent even for small files. The producer **never stops early**; it runs until every file in the dataset has been fully streamed (or permanently skipped).
 
 ### Speed Control
 
@@ -511,9 +640,25 @@ docker compose up -d --force-recreate producer
 | Detail | Value |
 |---|---|
 | Kaggle dataset | `footballjoe789/us-stock-dataset` |
-| File pattern matched | `data/stockhistory/*.csv` |
+| File pattern matched | `Data/StockHistory/<TICKER>.csv` |
 | Required columns | `date`, `open`, `high`, `low`, `close`, `volume` |
 | Ticker derivation | From the CSV filename — `AAPL.csv` → `ticker = "AAPL"` |
+| Ticker universe | `Stock_List.csv` (~6,600 symbols) — see [What is Stock_List.csv](#-what-is-stock_listcsv-and-how-is-it-used) |
+
+### Handling missing tickers (404s) — not a bug
+
+Because `Stock_List.csv` includes symbols Kaggle doesn't actually have a
+file for, you will see log lines like:
+
+```
+[DL] Data/StockHistory/AACIU.csv not in dataset — skipping (no retries).
+```
+
+This is **expected** and does not indicate a pipeline failure — it means
+that specific symbol simply isn't present in the Kaggle dataset. It's
+counted separately in the final summary (`not-in-dataset` vs other
+`skipped`). See the [Changelog](#-changelog) for the fix that made this
+fail fast instead of retrying for minutes per ticker.
 
 ---
 
@@ -534,10 +679,10 @@ After each batch, offsets are **committed manually** (`enable.auto.commit = fals
 |---|---|
 | `auto.offset.reset` | `earliest` — replay from the beginning on first run |
 | `enable.auto.commit` | `false` — manual commit after each validated batch |
-| `max.poll.interval.ms` | `300000` (5 minutes) |
-| `session.timeout.ms` | `30000` (30 seconds) |
+| `max.poll.interval.ms` | `600000` (10 minutes — producer can be slow) |
+| `session.timeout.ms` | `60000` (60 seconds) |
 | `fetch.min.bytes` | `1` |
-| `fetch.wait.max.ms` | `500` |
+| `fetch.wait.max.ms` | `1000` |
 
 ---
 
@@ -681,7 +826,7 @@ raw_stream = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP) \
     .option("subscribe", KAFKA_TOPIC) \
-    .option("startingOffsets", "earliest") \          # replay from the start
+    .option("startingOffsets", "earliest") \
     .option("kafka.group.id", CONSUMER_GROUP) \
     .option("failOnDataLoss", "false") \
     .load()
@@ -744,9 +889,17 @@ pip install -r requirements.txt
 > kaggle datasets files footballjoe789/us-stock-dataset
 > ```
 
+**Producer logs `not in dataset — skipping` repeatedly for many tickers**
+
+> This is expected — see [Handling missing tickers (404s)](#handling-missing-tickers-404s--not-a-bug) and the [Changelog](#-changelog). It means `Stock_List.csv` includes symbols that Kaggle's dataset doesn't have files for; they're skipped immediately, not retried.
+
+**Producer looks "stuck" on one ticker for minutes**
+
+> If you're running an older copy of `producer.py` (before the fix in the [Changelog](#-changelog)), 404s were retried 10× with backoff, costing minutes per missing ticker. Update to the current `kafka/producer.py` and recreate the container: `docker compose up -d --force-recreate producer`.
+
 **Consumer shows `Topic not found` and keeps retrying**
 
-> The consumer retries for up to 5 minutes (60 × 5 s). Ensure `kafka-init` completed successfully:
+> The consumer retries for up to 10 minutes (120 × 5 s). Ensure `kafka-init` completed successfully:
 > ```bash
 > docker compose logs kafka-init
 > ```
