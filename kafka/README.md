@@ -41,6 +41,7 @@
 - [Environment Variables](#-environment-variables)
 - [Validation Rules](#-validation-rules)
 - [M1 → M2 Handover Reference](#-m1--m2-handover-reference)
+- [M2 Spark Structured Streaming — Start Here](#-m2-spark-structured-streaming--start-here)
 - [Python Dependencies](#-python-dependencies)
 - [Troubleshooting](#-troubleshooting)
 
@@ -298,6 +299,46 @@ Docker Compose will:
 4. Start the **consumer** — reads events, validates them, and logs batch statistics
 5. Start **kafka-ui** at `http://localhost:8080`
 
+### 2a — Start only what you need (recommended for M2 Spark work)
+
+If you are working on the M2 Spark job and only need the Kafka cluster + data flowing in — you don't need to run the M1 validation consumer inside Docker. Start just the three services Spark depends on:
+
+```bash
+# Bring up brokers + topic init first (one-time, blocking until topics exist)
+docker compose up -d kafka-1 kafka-2 kafka-3 kafka-init
+
+# Wait until kafka-init finishes (check with: docker compose logs kafka-init)
+# Then start the producer and the UI
+docker compose up -d producer kafka-ui
+```
+
+Or as a single command once the brokers are already healthy:
+
+```bash
+docker compose up producer consumer kafka-ui
+```
+
+> **Note:** `producer` and `consumer` without `-d` run in the foreground so you see their logs directly. Add `-d` to detach.
+
+Check everything is running:
+
+```bash
+docker compose ps
+```
+
+Expected output — all three brokers `healthy`, producer and consumer `running`:
+
+```
+NAME              STATUS          PORTS
+kafka-1           healthy         0.0.0.0:9092->9092/tcp
+kafka-2           healthy         0.0.0.0:9093->9093/tcp
+kafka-3           healthy         0.0.0.0:9094->9094/tcp
+kafka-init        exited (0)
+stocks-producer   running
+stocks-consumer   running
+kafka-ui          running         0.0.0.0:8080->8080/tcp
+```
+
 ### 3 — Watch the logs
 
 ```bash
@@ -524,7 +565,253 @@ python kafka/topic_config.py
 
 ---
 
-## 📦 Python Dependencies
+## ⚡ M2 Spark Structured Streaming — Start Here
+
+Everything below is what you need to connect your Spark job to the running Kafka cluster and start consuming and processing the stock events.
+
+### Step 1 — Ensure M1 is running
+
+```bash
+# Brokers must be healthy and producer must be streaming
+docker compose ps
+
+# Confirm events are flowing — you should see messages in the topic
+docker compose logs --tail=20 producer
+```
+
+Open **[http://localhost:8080](http://localhost:8080)** → Topics → `us-stocks-raw` → Messages to visually confirm events are arriving.
+
+---
+
+### Step 2 — Spark Dependencies (Maven packages)
+
+Spark needs the Kafka connector JAR. Pass it at submit time or add it to your `SparkSession`:
+
+```bash
+# spark-submit
+spark-submit \
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+  your_spark_job.py
+```
+
+Or pin it in your `SparkSession` builder:
+
+```python
+spark = SparkSession.builder \
+    .appName("us-stocks-streaming") \
+    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
+    .getOrCreate()
+```
+
+> Match the Scala version (`2.12`) and Spark version (`3.5.0`) to your local Spark installation. Check with `spark-submit --version`.
+
+---
+
+### Step 3 — Connect to Kafka and Read the Stream
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, from_json, to_timestamp
+from pyspark.sql.types import (
+    StructType, StructField,
+    LongType, StringType, DoubleType, TimestampType
+)
+
+# ── Spark Session ────────────────────────────────────────────────────────────
+spark = SparkSession.builder \
+    .appName("us-stocks-m2-streaming") \
+    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("WARN")
+
+# ── Kafka connection — use localhost ports when Spark runs on the host machine
+KAFKA_BOOTSTRAP = "localhost:9092,localhost:9093,localhost:9094"
+# If Spark runs INSIDE the same Docker network (stocks-net), use:
+# KAFKA_BOOTSTRAP = "kafka-1:29092,kafka-2:29093,kafka-3:29094"
+
+KAFKA_TOPIC     = "us-stocks-raw"
+CONSUMER_GROUP  = "spark-streaming-group"   # independent from M1
+
+# ── Read raw stream from Kafka ───────────────────────────────────────────────
+raw_stream = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP) \
+    .option("subscribe", KAFKA_TOPIC) \
+    .option("startingOffsets", "earliest") \          # replay from the start
+    .option("kafka.group.id", CONSUMER_GROUP) \
+    .option("failOnDataLoss", "false") \
+    .load()
+
+# raw_stream columns: key (binary), value (binary), topic, partition, offset,
+#                     timestamp (Kafka ingest time), timestampType
+```
+
+---
+
+### Step 4 — Define the Schema and Parse JSON
+
+Copy this schema exactly — it mirrors the canonical event shape produced by `producer.py`:
+
+```python
+STOCK_SCHEMA = StructType([
+    StructField("event_id",       LongType(),      nullable=False),
+    StructField("ticker",         StringType(),    nullable=False),
+    StructField("date",           StringType(),    nullable=False),  # parse below
+    StructField("open",           DoubleType(),    nullable=False),
+    StructField("high",           DoubleType(),    nullable=False),
+    StructField("low",            DoubleType(),    nullable=False),
+    StructField("close",          DoubleType(),    nullable=False),
+    StructField("volume",         DoubleType(),    nullable=False),
+    StructField("dividends",      DoubleType(),    nullable=True),
+    StructField("stock_splits",   DoubleType(),    nullable=True),
+    StructField("stochk_14_3_3",  DoubleType(),    nullable=True),   # null during warm-up
+    StructField("stochd_14_3_3",  DoubleType(),    nullable=True),   # null during warm-up
+    StructField("source_file",    StringType(),    nullable=True),
+    StructField("produced_at",    StringType(),    nullable=True),   # parse below
+])
+
+# ── Deserialise and flatten ──────────────────────────────────────────────────
+parsed_stream = (
+    raw_stream
+    .select(
+        col("key").cast("string").alias("kafka_key"),       # = ticker
+        col("partition").alias("kafka_partition"),
+        col("offset").alias("kafka_offset"),
+        col("timestamp").alias("kafka_ingest_time"),        # Kafka broker timestamp
+        from_json(col("value").cast("string"), STOCK_SCHEMA).alias("data")
+    )
+    .select(
+        col("kafka_key"),
+        col("kafka_partition"),
+        col("kafka_offset"),
+        col("kafka_ingest_time"),
+        col("data.*")                                       # explode all event fields
+    )
+    # Cast date strings to proper types
+    .withColumn("date",        col("date").cast("date"))
+    .withColumn("produced_at", to_timestamp(col("produced_at")))
+)
+
+# parsed_stream is now a clean streaming DataFrame ready for transformations
+```
+
+---
+
+### Step 5 — Apply Transformations
+
+```python
+from pyspark.sql.functions import (
+    window, avg, max as spark_max, min as spark_min,
+    round as spark_round, count
+)
+
+# ── Example 1: filter a single ticker ───────────────────────────────────────
+aapl_stream = parsed_stream.filter(col("ticker") == "AAPL")
+
+# ── Example 2: daily OHLCV summary (tumbling window on trading date) ─────────
+daily_summary = (
+    parsed_stream
+    .groupBy("ticker", "date")
+    .agg(
+        spark_round(avg("close"),  4).alias("avg_close"),
+        spark_round(spark_max("high"),   4).alias("day_high"),
+        spark_round(spark_min("low"),    4).alias("day_low"),
+        spark_round(avg("volume"), 0).alias("avg_volume"),
+        count("*").alias("row_count"),
+    )
+)
+
+# ── Example 3: 1-minute rolling window on produced_at ────────────────────────
+rolling_1m = (
+    parsed_stream
+    .withWatermark("produced_at", "2 minutes")
+    .groupBy(
+        window(col("produced_at"), "1 minute"),
+        col("ticker")
+    )
+    .agg(
+        spark_round(avg("close"), 4).alias("avg_close"),
+        spark_round(avg("volume"), 0).alias("avg_volume"),
+    )
+)
+```
+
+---
+
+### Step 6 — Write Output (choose a sink)
+
+```python
+# ── Sink A: console (development / debugging) ────────────────────────────────
+query_console = (
+    parsed_stream.writeStream
+    .outputMode("append")
+    .format("console")
+    .option("truncate", False)
+    .option("numRows", 20)
+    .trigger(processingTime="10 seconds")
+    .start()
+)
+
+# ── Sink B: Parquet on HDFS (or local path for testing) ──────────────────────
+query_hdfs = (
+    parsed_stream.writeStream
+    .outputMode("append")
+    .format("parquet")
+    .option("path", "hdfs://namenode:9000/data/stocks/raw/")   # or a local path
+    .option("checkpointLocation", "hdfs://namenode:9000/checkpoints/stocks-raw/")
+    .partitionBy("ticker", "date")
+    .trigger(processingTime="30 seconds")
+    .start()
+)
+
+# ── Sink C: PostgreSQL via foreachBatch ──────────────────────────────────────
+def write_to_postgres(batch_df, batch_id):
+    (
+        batch_df.write
+        .format("jdbc")
+        .option("url",      "jdbc:postgresql://localhost:5432/stocks")
+        .option("dbtable",  "stock_events")
+        .option("user",     "your_pg_user")
+        .option("password", "your_pg_password")
+        .option("driver",   "org.postgresql.Driver")
+        .mode("append")
+        .save()
+    )
+
+query_pg = (
+    parsed_stream.writeStream
+    .outputMode("append")
+    .foreachBatch(write_to_postgres)
+    .option("checkpointLocation", "/tmp/checkpoints/stocks-pg/")
+    .trigger(processingTime="30 seconds")
+    .start()
+)
+
+# ── Wait for all queries ─────────────────────────────────────────────────────
+spark.streams.awaitAnyTermination()
+```
+
+---
+
+### Spark ↔ Kafka Connection Reference
+
+| Setting | Value |
+|---|---|
+| **Bootstrap (Spark on host)** | `localhost:9092,localhost:9093,localhost:9094` |
+| **Bootstrap (Spark in Docker on `stocks-net`)** | `kafka-1:29092,kafka-2:29093,kafka-3:29094` |
+| **Topic** | `us-stocks-raw` |
+| **Consumer group** | `spark-streaming-group` |
+| **Starting offset** | `earliest` (re-reads all history) or `latest` (live only) |
+| **Message key** | `ticker` — use `.cast("string")` to decode |
+| **Message value** | JSON string — parse with `from_json` + `STOCK_SCHEMA` |
+| **Kafka ingest timestamp** | `timestamp` column on the raw stream (Kafka broker time) |
+| **Event timestamp** | `produced_at` field inside the JSON (producer wall-clock, UTC) |
+| **Maven package** | `org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0` |
+
+> **Checkpoint locations** are mandatory for fault-tolerant streaming. Always set `checkpointLocation` before running in production. Without it, Spark cannot recover from a restart.
+
+---
 
 | Package | Version | Purpose |
 |---|---|---|
