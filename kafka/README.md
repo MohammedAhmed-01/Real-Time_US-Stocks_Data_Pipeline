@@ -25,25 +25,50 @@
 
 ## 📋 Table of Contents
 
-- [Overview](#-overview)
-- [Architecture](#-architecture)
-- [Project Structure](#-project-structure)
-- [Kafka Cluster Configuration](#-kafka-cluster-configuration)
-- [Topic Design](#-topic-design)
-- [Event Schema](#-event-schema)
-- [Prerequisites](#-prerequisites)
-- [Quick Start](#-quick-start)
-- [Running the Pipeline](#-running-the-pipeline)
-- [Web UIs & Monitoring](#-web-uis--monitoring)
-- [Producer Details](#-producer-details)
-- [Consumer / Validator Details](#-consumer--validator-details)
-- [Consumer Groups](#-consumer-groups)
-- [Environment Variables](#-environment-variables)
-- [Validation Rules](#-validation-rules)
-- [M1 → M2 Handover Reference](#-m1--m2-handover-reference)
-- [M2 Spark Structured Streaming — Start Here](#-m2-spark-structured-streaming--start-here)
-- [Python Dependencies](#-python-dependencies)
-- [Troubleshooting](#-troubleshooting)
+- [📋 Table of Contents](#-table-of-contents)
+- [🔍 Overview](#-overview)
+- [🏗 Architecture](#-architecture)
+  - [Data Flow](#data-flow)
+- [📁 Project Structure](#-project-structure)
+- [⚙️ Kafka Cluster Configuration](#️-kafka-cluster-configuration)
+  - [Broker Port Mapping](#broker-port-mapping)
+- [📨 Topic Design](#-topic-design)
+  - [`us-stocks-raw` — Primary Ingest Topic](#us-stocks-raw--primary-ingest-topic)
+  - [`us-stocks-dead-letter` — Failed Events](#us-stocks-dead-letter--failed-events)
+- [🗂 Event Schema](#-event-schema)
+  - [Field Reference](#field-reference)
+- [🧰 Prerequisites](#-prerequisites)
+- [🚀 Quick Start](#-quick-start)
+  - [1 — Clone \& configure](#1--clone--configure)
+  - [2 — Start the full stack](#2--start-the-full-stack)
+  - [2a — Start only what you need (recommended for M2 Spark work)](#2a--start-only-what-you-need-recommended-for-m2-spark-work)
+  - [3 — Watch the logs](#3--watch-the-logs)
+  - [4 — Open Kafka UI](#4--open-kafka-ui)
+  - [5 — Stop everything](#5--stop-everything)
+- [🏃 Running the Pipeline](#-running-the-pipeline)
+  - [Producer — local (outside Docker)](#producer--local-outside-docker)
+  - [Consumer — local (outside Docker)](#consumer--local-outside-docker)
+  - [Producer CLI Reference](#producer-cli-reference)
+  - [Consumer CLI Reference](#consumer-cli-reference)
+- [🖥 Web UIs \& Monitoring](#-web-uis--monitoring)
+  - [Kafka UI — `http://localhost:8080`](#kafka-ui--httplocalhost8080)
+- [📤 Producer Details](#-producer-details)
+  - [Speed Control](#speed-control)
+  - [Kafka Producer Settings](#kafka-producer-settings)
+  - [Dataset Source](#dataset-source)
+- [📥 Consumer / Validator Details](#-consumer--validator-details)
+  - [Kafka Consumer Settings](#kafka-consumer-settings)
+- [👥 Consumer Groups](#-consumer-groups)
+- [🔧 Environment Variables](#-environment-variables)
+- [✅ Validation Rules](#-validation-rules)
+- [🔗 M1 → M2 Handover Reference](#-m1--m2-handover-reference)
+  - [Key Values for Spark Structured Streaming](#key-values-for-spark-structured-streaming)
+- [⚡ M2 Spark Structured Streaming — Start Here](#-m2-spark-structured-streaming--start-here)
+  - [Step 1 — Ensure M1 is running](#step-1--ensure-m1-is-running)
+  - [Step 2 — Spark Dependencies (Maven packages)](#step-2--spark-dependencies-maven-packages)
+  - [Step 3 — Connect to Kafka and Read the Stream](#step-3--connect-to-kafka-and-read-the-stream)
+  - [Spark ↔ Kafka Connection Reference](#spark--kafka-connection-reference)
+- [🐛 Troubleshooting](#-troubleshooting)
 
 ---
 
@@ -441,23 +466,41 @@ Powered by [Provectus Kafka UI](https://github.com/provectus/kafka-ui). Accessib
 
 ## 📤 Producer Details
 
-The producer runs in **parallel real-time mode** using two coordinated threads:
+The producer runs in **steady real-time mode** using two coordinated threads:
 
 | Thread | Role |
 |---|---|
-| **Download thread** | Downloads CSV files from Kaggle one at a time; pushes `(filename, DataFrame)` pairs to an in-memory queue (max 3 files buffered) |
-| **Main thread** | Pops files from the queue, converts each row to a JSON event, and produces micro-batches to Kafka |
+| **Download thread** | Downloads CSV files from Kaggle one at a time; pushes `(filename, DataFrame)` pairs to an in-memory queue (max 5 files buffered). Retries each file up to 10 times with backoff before skipping. |
+| **Main thread** | Pops files from the queue, converts each row to a JSON event, and produces to Kafka at a precise controlled rate set by `--rows-per-sec`. |
 
-This design keeps the network download from blocking Kafka production, and keeps memory usage bounded.
+A `next_row_time` clock enforces the rate accurately at the individual row level — not per batch — so the pace is consistent even for small files. The producer **never stops early**; it runs until every file in the dataset has been fully streamed.
+
+### Speed Control
+
+The `--rows-per-sec` flag controls exactly how many rows are produced per second. Pair it with `--batch-size` for best throughput:
+
+| `--rows-per-sec` | `--batch-size` | Use case |
+|---|---|---|
+| `1` | `50` | Slow — see every message arrive in Kafka UI |
+| `10` | `50` | Moderate — good for development and testing |
+| `100` | `100` | Fast |
+| `1000` | `500` | Very fast — bulk loading |
+| `10000` | `1000` | Maximum speed — as fast as the network allows |
+
+To change speed without restarting the cluster, edit `docker-compose.yml` and run:
+
+```bash
+docker compose up -d --force-recreate producer
+```
 
 ### Kafka Producer Settings
 
 | Setting | Value | Reason |
 |---|---|---|
 | `acks` | `all` | Strongest durability — leader + all ISR replicas confirm write |
-| `retries` | `5` | Automatic retry on transient broker errors |
-| `retry.backoff.ms` | `500` | Pause between retries |
-| `linger.ms` | `10` | Accumulate small messages into larger batches |
+| `retries` | `10` | Automatic retry on transient broker errors |
+| `retry.backoff.ms` | `1000` | Pause between retries |
+| `linger.ms` | `20` | Accumulate small messages into larger batches |
 | `batch.size` | `65536` | 64 KB produce batch |
 | `compression.type` | `lz4` | Fast compression, matches topic-level config |
 | `enable.idempotence` | `true` | Exactly-once semantics on the producer side |
@@ -716,5 +759,3 @@ pip install -r requirements.txt
 **Out of memory / brokers restarting**
 
 > Allocate at least 8 GB RAM to Docker in Docker Desktop → Settings → Resources. Three Kafka brokers are memory-intensive.
-
-

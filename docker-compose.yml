@@ -129,9 +129,6 @@ services:
       start_period: 30s
 
   # ── Topic initialiser (runs once, then exits) ──────────────────────────────
-  # FIX: every kafka-topics call is on ONE line — backslash continuations
-  #      inside a YAML block scalar are eaten by the YAML parser before bash
-  #      sees them, which caused "Command must include exactly one action".
   kafka-init:
     image: confluentinc/cp-kafka:7.6.1
     container_name: kafka-init
@@ -172,13 +169,13 @@ services:
         echo '--------------------------------------------------'
     restart: "no"
 
-  # ── Producer (streams Kaggle → Kafka) ─────────────────────────────────────
+  # ── Producer (streams Kaggle → Kafka at 1 row/sec steady pace) ────────────
   producer:
     build:
       context: .
       dockerfile: Dockerfile.python
     container_name: stocks-producer
-    restart: "no"
+    restart: "no"                        # never auto-restart — it runs to completion
     networks:
       - stocks-net
     depends_on:
@@ -195,17 +192,20 @@ services:
       KAFKA_TOPIC:       us-stocks-raw
       KAGGLE_USERNAME:   ${KAGGLE_USERNAME}
       KAGGLE_KEY:        ${KAGGLE_KEY}
-    command: ["python", "producer.py", "--speed", "5", "--batch-size", "50"]
+    # --rows-per-sec 1   → 1 row every second (steady, visible in Kafka UI)
+    # --rows-per-sec 10  → 10 rows/s if you want it faster
+    # --rows-per-sec 100 → 100 rows/s for bulk loading
+    command: ["python", "producer.py", "--rows-per-sec", "500", "--batch-size", "250"]
     volumes:
       - ./kafka:/app
 
-  # ── Consumer / validator ───────────────────────────────────────────────────
+  # ── Consumer / validator (runs until ALL data is consumed) ─────────────────
   consumer:
     build:
       context: .
       dockerfile: Dockerfile.python
     container_name: stocks-consumer
-    restart: on-failure
+    restart: on-failure                  # restart only on crash, not on clean exit
     networks:
       - stocks-net
     depends_on:
@@ -221,7 +221,10 @@ services:
       KAFKA_BOOTSTRAP:   kafka-1:29092,kafka-2:29093,kafka-3:29094
       KAFKA_TOPIC:       us-stocks-raw
       KAFKA_GROUP_ID:    m1-validation-group
-    command: ["python", "consumer.py", "--batch-size", "100"]
+    # --idle-timeout 180  → waits 3 minutes of silence across ALL partitions
+    #                       before declaring all data consumed and exiting.
+    #                       Increase this if the producer has long gaps between files.
+    command: ["python", "consumer.py", "--batch-size", "100", "--max-wait-ms", "5000", "--idle-timeout", "180"]
     volumes:
       - ./kafka:/app
 
@@ -240,6 +243,9 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME:             us-stocks-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
+      # Show message content decoded as JSON in the UI
+      KAFKA_CLUSTERS_0_AUDIT_TOPICAUDITENABLED:  "false"
+      DYNAMIC_CONFIG_ENABLED:                    "true"
 
 # ── Volumes ────────────────────────────────────────────────────────────────────
 volumes:

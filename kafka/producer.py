@@ -1,15 +1,19 @@
 """
-producer.py — US Stock Dataset Kafka Producer (Parallel Real-Time Mode)
-=======================================================================
+producer.py — US Stock Dataset Kafka Producer (Steady Real-Time Mode)
+=====================================================================
 M1 · Data & Kafka  |  Real-Time US Stocks Data Pipeline
 
 Architecture:
     Download Thread  →  queue(fname, df)  →  Main Thread (producer)
     Downloads CSV files from Kaggle and enqueues them; the main thread
-    converts rows to JSON events and publishes them to Kafka.
+    converts rows to JSON events and publishes them to Kafka at a
+    controlled pace (--rows-per-sec, default 1 row/s).
+
+    The producer NEVER stops until every file in the dataset has been
+    fully produced to Kafka.
 
 Usage:
-    python producer.py [--speed FLOAT] [--batch-size INT] [--ticker SYMBOL]
+    python producer.py [--rows-per-sec FLOAT] [--batch-size INT] [--ticker SYMBOL]
 
 Environment variables (or .env):
     KAGGLE_USERNAME   Kaggle account username
@@ -61,9 +65,9 @@ KAGGLE_DATASET      = "footballjoe789/us-stock-dataset"
 KAGGLE_API_BASE     = "https://www.kaggle.com/api/v1"
 DEFAULT_TOPIC       = "us-stocks-raw"
 DEFAULT_BROKER      = "localhost:9092"
-MICRO_BATCH_SIZE    = 50
-SPEED_FACTOR        = 1.0
-QUEUE_MAXSIZE       = 3
+DEFAULT_ROWS_PER_SEC = 1.0       # 1 row per second by default (steady pace)
+DEFAULT_BATCH_SIZE  = 50         # rows per Kafka produce call
+QUEUE_MAXSIZE       = 5          # max files buffered between download and produce
 
 STOCK_PATH_PREFIX   = "data/stockhistory"
 REQUIRED_STOCK_COLS = {"date", "open", "high", "low", "close", "volume"}
@@ -98,7 +102,10 @@ class _Stats:
 
     def elapsed_str(self) -> str:
         elapsed = int(time.time() - self.start_time)
-        return f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+        h = elapsed // 3600
+        m = (elapsed % 3600) // 60
+        s = elapsed % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
     def ev_per_s(self) -> float:
         elapsed = max(time.time() - self.start_time, 1e-9)
@@ -110,7 +117,6 @@ class _Stats:
 # ---------------------------------------------------------------------------
 
 def _kaggle_auth() -> tuple[str, str]:
-    """Return (username, key) from env vars or ~/.kaggle/kaggle.json."""
     username = os.getenv("KAGGLE_USERNAME")
     key      = os.getenv("KAGGLE_KEY")
 
@@ -129,12 +135,10 @@ def _kaggle_auth() -> tuple[str, str]:
             "Set KAGGLE_USERNAME / KAGGLE_KEY env vars, "
             "or place kaggle.json in ~/.kaggle/."
         )
-
     return username, key
 
 
 def _kaggle_env() -> dict:
-    """Build an os.environ copy that always contains Kaggle credentials."""
     username, key = _kaggle_auth()
     return {**os.environ, "KAGGLE_USERNAME": username, "KAGGLE_KEY": key}
 
@@ -144,21 +148,17 @@ def _kaggle_env() -> dict:
 # ---------------------------------------------------------------------------
 
 def list_kaggle_csv_files(dataset: str = KAGGLE_DATASET) -> list[str]:
-    """Return a sorted list of all CSV file paths in the Kaggle dataset."""
     log.info("Fetching file list for dataset '%s' …", dataset)
-
     try:
         result = subprocess.run(
             ["kaggle", "datasets", "files", dataset, "--csv"],
-            capture_output=True,
-            text=True,
-            env=_kaggle_env(),
-            timeout=60,
+            capture_output=True, text=True,
+            env=_kaggle_env(), timeout=60,
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip())
 
-        lines     = result.stdout.strip().splitlines()
+        lines = result.stdout.strip().splitlines()
         csv_files = sorted(
             line.split(",")[0].strip()
             for line in lines[1:]
@@ -173,22 +173,18 @@ def list_kaggle_csv_files(dataset: str = KAGGLE_DATASET) -> list[str]:
 
 
 def _list_csv_files_rest(dataset: str) -> list[str]:
-    """REST-API fallback for listing CSV files when the CLI is unavailable."""
     username, key = _kaggle_auth()
     owner, slug   = dataset.split("/", 1)
-
     endpoints = [
         f"{KAGGLE_API_BASE}/datasets/{owner}/{slug}/files?page=1&pageSize=500",
         f"{KAGGLE_API_BASE}/datasets/{owner}/{slug}?fields=files",
     ]
-
     for url in endpoints:
         try:
             resp = requests.get(url, auth=(username, key), timeout=30)
             if resp.status_code == 404:
                 continue
             resp.raise_for_status()
-
             data = resp.json()
             raw  = data if isinstance(data, list) else (
                 data.get("datasetFiles") or data.get("files") or []
@@ -201,7 +197,6 @@ def _list_csv_files_rest(dataset: str) -> list[str]:
             if csv_files:
                 log.info("Found %d CSV files via REST fallback.", len(csv_files))
                 return csv_files
-
         except Exception as exc:
             log.warning("REST endpoint %s failed: %s", url, exc)
 
@@ -212,85 +207,86 @@ def _list_csv_files_rest(dataset: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Kaggle: download one CSV file
+# Kaggle: download one CSV file  (with unlimited retries)
 # ---------------------------------------------------------------------------
 
 def _normalise_df(df: pd.DataFrame, filename: str) -> pd.DataFrame:
-    """Lowercase and underscore column names; ensure a 'ticker' column exists."""
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
     if "ticker" not in df.columns and "symbol" not in df.columns:
         ticker = os.path.splitext(os.path.basename(filename))[0].upper()
         df.insert(0, "ticker", ticker)
     elif "symbol" in df.columns and "ticker" not in df.columns:
         df = df.rename(columns={"symbol": "ticker"})
-
     return df
 
 
 def _is_stock_file(df: pd.DataFrame) -> bool:
-    """Return True if the DataFrame contains all required OHLCV columns."""
     return REQUIRED_STOCK_COLS.issubset(set(df.columns))
 
 
-def download_single_csv(filename: str, dataset: str = KAGGLE_DATASET) -> pd.DataFrame:
-    """Download one CSV from Kaggle (CLI first, REST fallback) and return a DataFrame."""
-    # --- CLI path ---
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = subprocess.run(
-                [
-                    "kaggle", "datasets", "download",
-                    dataset,
-                    "--file",  filename,
-                    "--path",  tmpdir,
-                    "--unzip",
-                    "--quiet",
-                ],
-                capture_output=True,
-                text=True,
-                env=_kaggle_env(),
-                timeout=120,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "kaggle CLI returned non-zero")
+def download_single_csv(
+    filename: str,
+    dataset: str = KAGGLE_DATASET,
+    max_retries: int = 10,
+) -> pd.DataFrame:
+    """Download one CSV — retries forever (up to max_retries) on any error."""
+    for attempt in range(1, max_retries + 1):
+        # --- CLI path ---
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                result = subprocess.run(
+                    [
+                        "kaggle", "datasets", "download",
+                        dataset, "--file", filename,
+                        "--path", tmpdir, "--unzip", "--quiet",
+                    ],
+                    capture_output=True, text=True,
+                    env=_kaggle_env(), timeout=300,
+                )
+                if result.returncode == 0:
+                    for root, _dirs, files in os.walk(tmpdir):
+                        for fname in files:
+                            if fname.lower().endswith(".csv"):
+                                df = pd.read_csv(
+                                    os.path.join(root, fname), low_memory=False
+                                )
+                                return _normalise_df(df, filename)
+        except Exception as cli_err:
+            log.warning("[DL] CLI attempt %d/%d failed for %s: %s",
+                        attempt, max_retries, filename, cli_err)
 
-            for root, _dirs, files in os.walk(tmpdir):
-                for fname in files:
-                    if fname.lower().endswith(".csv"):
-                        df = pd.read_csv(os.path.join(root, fname), low_memory=False)
-                        return _normalise_df(df, filename)
+        # --- REST fallback ---
+        try:
+            username, key = _kaggle_auth()
+            url  = f"{KAGGLE_API_BASE}/datasets/download/{dataset}/{filename}"
+            resp = requests.get(url, auth=(username, key), stream=True, timeout=300)
+            resp.raise_for_status()
+            buf = io.BytesIO(resp.content)
+            if zipfile.is_zipfile(buf):
+                buf.seek(0)
+                with zipfile.ZipFile(buf) as zf:
+                    csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                    if csv_names:
+                        with zf.open(csv_names[0]) as fh:
+                            df = pd.read_csv(fh, low_memory=False)
+                            return _normalise_df(df, filename)
+            else:
+                buf.seek(0)
+                df = pd.read_csv(buf, low_memory=False)
+                return _normalise_df(df, filename)
+        except Exception as rest_err:
+            log.warning("[DL] REST attempt %d/%d failed for %s: %s",
+                        attempt, max_retries, filename, rest_err)
 
-            raise ValueError(f"CLI downloaded nothing recognisable for {filename}.")
+        wait = min(30, 5 * attempt)
+        log.warning("[DL] Retrying %s in %d s …", filename, wait)
+        time.sleep(wait)
 
-    except Exception as cli_err:
-        log.warning("kaggle CLI download failed for %s (%s) — trying REST …", filename, cli_err)
-
-    # --- REST fallback ---
-    username, key = _kaggle_auth()
-    url  = f"{KAGGLE_API_BASE}/datasets/download/{dataset}/{filename}"
-    resp = requests.get(url, auth=(username, key), stream=True, timeout=120)
-    resp.raise_for_status()
-
-    buf = io.BytesIO(resp.content)
-
-    if zipfile.is_zipfile(buf):
-        buf.seek(0)
-        with zipfile.ZipFile(buf) as zf:
-            csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-            if not csv_names:
-                raise ValueError(f"No CSV found inside ZIP for {filename}.")
-            with zf.open(csv_names[0]) as fh:
-                df = pd.read_csv(fh, low_memory=False)
-    else:
-        buf.seek(0)
-        df = pd.read_csv(buf, low_memory=False)
-
-    return _normalise_df(df, filename)
+    raise RuntimeError(f"All {max_retries} download attempts failed for {filename}.")
 
 
 # ---------------------------------------------------------------------------
-# Background download thread
+# Background download thread — NEVER skips a file, retries on failure
 # ---------------------------------------------------------------------------
 
 def _download_worker(
@@ -299,7 +295,7 @@ def _download_worker(
     file_queue: queue.Queue,
     stats: _Stats,
 ) -> None:
-    """Download CSV files one by one and push (filename, DataFrame) onto the queue."""
+    """Download every stock CSV and push it onto the queue. Never exits early."""
     for fname in csv_files:
         normalised = fname.lower().replace("\\", "/")
 
@@ -323,10 +319,7 @@ def _download_worker(
                 continue
 
             if not _is_stock_file(df):
-                log.warning(
-                    "[DL] %s missing required stock columns (found: %s) — skipping.",
-                    fname, list(df.columns),
-                )
+                log.warning("[DL] %s missing required columns — skipping.", fname)
                 stats.file_skipped()
                 continue
 
@@ -335,10 +328,11 @@ def _download_worker(
                 df = df.sort_values(date_cols[0], ascending=True)
 
             log.info("[DL] Ready  file=%-30s  rows=%d", os.path.basename(fname), len(df))
-            file_queue.put((fname, df))
+            file_queue.put((fname, df))   # blocks if queue is full — applies back-pressure
 
         except Exception as exc:
-            log.warning("[DL] Skipping %s — %s", fname, exc)
+            # Last-resort skip only after all retries exhausted
+            log.error("[DL] Permanently skipping %s after all retries: %s", fname, exc)
             stats.file_skipped()
 
     file_queue.put(_SENTINEL)
@@ -350,8 +344,6 @@ def _download_worker(
 # ---------------------------------------------------------------------------
 
 def row_to_event(row: pd.Series, source_file: str, event_id: int) -> dict:
-    """Convert a single DataFrame row to a canonical Kafka event dict."""
-
     def _safe(key: str) -> Optional[float]:
         val = row.get(key)
         if val is None:
@@ -368,20 +360,20 @@ def row_to_event(row: pd.Series, source_file: str, event_id: int) -> dict:
         date_str = str(raw_date)[:10]
 
     return {
-        "event_id":      event_id,
-        "ticker":        str(row.get("ticker", "UNKNOWN")).upper(),
-        "date":          date_str,
-        "open":          _safe("open"),
-        "high":          _safe("high"),
-        "low":           _safe("low"),
-        "close":         _safe("close"),
-        "volume":        _safe("volume"),
-        "dividends":     _safe("dividends"),
-        "stock_splits":  _safe("stock_splits"),
-        "stochk_14_3_3": _safe("stochk_14_3_3"),
-        "stochd_14_3_3": _safe("stochd_14_3_3"),
-        "source_file":   source_file,
-        "produced_at":   datetime.utcnow().isoformat() + "Z",
+        "event_id":       event_id,
+        "ticker":         str(row.get("ticker", "UNKNOWN")).upper(),
+        "date":           date_str,
+        "open":           _safe("open"),
+        "high":           _safe("high"),
+        "low":            _safe("low"),
+        "close":          _safe("close"),
+        "volume":         _safe("volume"),
+        "dividends":      _safe("dividends"),
+        "stock_splits":   _safe("stock_splits"),
+        "stochk_14_3_3":  _safe("stochk_14_3_3"),
+        "stochd_14_3_3":  _safe("stochd_14_3_3"),
+        "source_file":    source_file,
+        "produced_at":    datetime.utcnow().isoformat() + "Z",
     }
 
 
@@ -390,22 +382,20 @@ def row_to_event(row: pd.Series, source_file: str, event_id: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_producer(bootstrap_servers: str) -> Producer:
-    """Return a configured confluent-kafka Producer."""
     return Producer({
-        "bootstrap.servers":                      bootstrap_servers,
-        "acks":                                   "all",
-        "retries":                                5,
-        "retry.backoff.ms":                       500,
-        "linger.ms":                              10,
-        "batch.size":                             65536,
-        "compression.type":                       "lz4",
-        "enable.idempotence":                     True,
-        "max.in.flight.requests.per.connection":  5,
+        "bootstrap.servers":                     bootstrap_servers,
+        "acks":                                  "all",
+        "retries":                               10,
+        "retry.backoff.ms":                      1000,
+        "linger.ms":                             20,
+        "batch.size":                            65536,
+        "compression.type":                      "lz4",
+        "enable.idempotence":                    True,
+        "max.in.flight.requests.per.connection": 5,
     })
 
 
 def delivery_callback(err, msg) -> None:
-    """Log delivery success or failure for each produced message."""
     if err:
         log.error("Delivery FAILED | topic=%s | %s", msg.topic(), err)
     else:
@@ -420,7 +410,6 @@ def delivery_callback(err, msg) -> None:
 # ---------------------------------------------------------------------------
 
 def _produce_batch(producer: Producer, topic: str, batch: list[dict]) -> None:
-    """Produce all events in *batch* and trigger a non-blocking poll."""
     for event in batch:
         producer.produce(
             topic=topic,
@@ -437,16 +426,25 @@ def _produce_batch(producer: Producer, topic: str, batch: list[dict]) -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="US Stocks Kafka Producer — parallel download + produce"
+        description="US Stocks Kafka Producer — steady controlled pace"
     )
-    parser.add_argument("--speed",      type=float, default=SPEED_FACTOR,
-                        help="Replay speed multiplier (default: 1.0)")
-    parser.add_argument("--batch-size", type=int,   default=MICRO_BATCH_SIZE,
-                        help="Rows per Kafka micro-batch (default: 50)")
-    parser.add_argument("--ticker",     type=str,   default=None,
-                        help="Stream only this ticker symbol")
-    parser.add_argument("--topic",      type=str,   default=None,
-                        help="Override the target Kafka topic")
+    parser.add_argument(
+        "--rows-per-sec", type=float, default=DEFAULT_ROWS_PER_SEC,
+        help="Rows to produce per second (default: 1.0). "
+             "Use e.g. 10 for faster, 0.5 for slower.",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+        help="Rows per Kafka micro-batch (default: 50)",
+    )
+    parser.add_argument(
+        "--ticker", type=str, default=None,
+        help="Stream only this ticker symbol",
+    )
+    parser.add_argument(
+        "--topic", type=str, default=None,
+        help="Override the target Kafka topic",
+    )
     return parser.parse_args()
 
 
@@ -461,11 +459,16 @@ def main() -> None:
     bootstrap = os.getenv("KAFKA_BOOTSTRAP", DEFAULT_BROKER)
     topic     = args.topic or os.getenv("KAFKA_TOPIC", DEFAULT_TOPIC)
 
+    # How long to sleep between individual rows to hit the target rate
+    rows_per_sec   = max(args.rows_per_sec, 0.01)
+    sleep_per_row  = 1.0 / rows_per_sec   # seconds between rows
+
     log.info("=" * 62)
-    log.info("  US Stocks Kafka Producer  [PARALLEL REAL-TIME MODE]")
-    log.info("  Broker  : %s", bootstrap)
-    log.info("  Topic   : %s", topic)
-    log.info("  Speed   : %.1fx  |  Batch: %d rows", args.speed, args.batch_size)
+    log.info("  US Stocks Kafka Producer  [STEADY REAL-TIME MODE]")
+    log.info("  Broker       : %s", bootstrap)
+    log.info("  Topic        : %s", topic)
+    log.info("  Rows/sec     : %.2f  (%.3f s between rows)", rows_per_sec, sleep_per_row)
+    log.info("  Batch size   : %d rows", args.batch_size)
     log.info("=" * 62)
 
     csv_files   = list_kaggle_csv_files()
@@ -489,22 +492,21 @@ def main() -> None:
     )
     dl_thread.start()
 
-    producer        = build_producer(bootstrap)
-    delay_per_batch = max(
-        0.0,
-        (args.batch_size / 252 / 6.5 / 3600) / max(args.speed, 0.01),
-    )
+    producer     = build_producer(bootstrap)
+    total_events = 0
+    event_id     = 0
+    start_wall   = time.time()
 
-    total_events  = 0
-    total_batches = 0
-    event_id      = 0
-    start_wall    = time.time()
+    # Timing state for pacing
+    next_row_time = time.monotonic()
 
     try:
         while True:
             item = file_queue.get()
             if item is _SENTINEL:
-                log.info("All files consumed — flushing Kafka producer …")
+                log.info("=" * 62)
+                log.info("All files downloaded and produced — flushing …")
+                log.info("=" * 62)
                 break
 
             fname, df   = item
@@ -514,53 +516,57 @@ def main() -> None:
             file_start  = time.time()
 
             log.info(
-                "START  file=%-12s  rows=%d  overall=%d/%d done  total_events=%d",
-                basename, file_rows, stats.done_files, len(stock_files), total_events,
+                "START  file=%-14s  rows=%d  files=%d/%d done  total=%d",
+                basename, file_rows,
+                stats.done_files, len(stock_files),
+                total_events,
             )
 
             batch: list[dict] = []
 
             for _, row in df.iterrows():
+                # ── Pace control: sleep until it is time for the next row ──
+                now = time.monotonic()
+                if next_row_time > now:
+                    time.sleep(next_row_time - now)
+                next_row_time = time.monotonic() + sleep_per_row
+
                 batch.append(row_to_event(row, fname, event_id))
                 event_id += 1
 
                 if len(batch) >= args.batch_size:
                     _produce_batch(producer, topic, batch)
-
                     total_events  += len(batch)
-                    total_batches += 1
                     file_events   += len(batch)
                     stats.add_events(len(batch))
 
                     log.info(
-                        "  sent=%5d/%5d (%5.1f%%)  ev/s=%6.0f  elapsed=%s  total=%d",
+                        "  %-14s  sent=%5d/%5d (%5.1f%%)  total=%d  "
+                        "elapsed=%s  rate=%.2f rows/s",
+                        basename,
                         file_events, file_rows,
                         file_events / max(file_rows, 1) * 100,
-                        file_events / max(time.time() - file_start, 1e-9),
-                        stats.elapsed_str(),
                         total_events,
+                        stats.elapsed_str(),
+                        rows_per_sec,
                     )
-
                     batch = []
-                    if delay_per_batch > 0:
-                        time.sleep(delay_per_batch)
 
-            # Flush remaining partial batch
+            # Flush partial tail batch
             if batch:
                 _produce_batch(producer, topic, batch)
-                total_events  += len(batch)
-                total_batches += 1
-                file_events   += len(batch)
+                total_events += len(batch)
+                file_events  += len(batch)
                 stats.add_events(len(batch))
 
             stats.file_done()
             file_elapsed = time.time() - file_start
             log.info(
-                "DONE   file=%-12s  events=%d  time=%.1fs  ev/s=%.0f  "
-                "overall=%d/%d  grand_total=%d",
+                "DONE   file=%-14s  events=%d  time=%.1fs  "
+                "files=%d/%d  grand_total=%d",
                 basename, file_events, file_elapsed,
-                file_events / max(file_elapsed, 1e-9),
-                stats.done_files, len(stock_files), total_events,
+                stats.done_files, len(stock_files),
+                total_events,
             )
 
     except KeyboardInterrupt:
@@ -569,14 +575,15 @@ def main() -> None:
         log.error("Kafka error: %s", exc)
         raise
     finally:
-        producer.flush(timeout=30)
+        producer.flush(timeout=60)
         elapsed = time.time() - start_wall
         log.info("=" * 62)
-        log.info("  PRODUCER DONE")
+        log.info("  PRODUCER FINISHED")
         log.info("  Total events  : %d", total_events)
-        log.info("  Total batches : %d", total_batches)
-        log.info("  Wall time     : %.1f s", elapsed)
-        log.info("  Throughput    : %.0f events/s", total_events / max(elapsed, 1))
+        log.info("  Files done    : %d / %d", stats.done_files, len(stock_files))
+        log.info("  Files skipped : %d", stats.skipped_files)
+        log.info("  Wall time     : %.1f s  (%s)",
+                 elapsed, stats.elapsed_str())
         log.info("  Topic         : %s", topic)
         log.info("=" * 62)
 
