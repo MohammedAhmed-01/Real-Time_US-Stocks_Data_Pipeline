@@ -52,8 +52,6 @@ POLL_TIMEOUT         = 0.5
 TOPIC_RETRY_ATTEMPTS = 60
 TOPIC_RETRY_DELAY    = 5
 
-# Fields that MUST be present in every event (null values are caught separately).
-# Matches the exact keys produced by producer.row_to_event().
 REQUIRED_FIELDS: frozenset[str] = frozenset({
     "event_id", "ticker", "date",
     "open", "high", "low", "close", "volume",
@@ -62,88 +60,13 @@ REQUIRED_FIELDS: frozenset[str] = frozenset({
     "source_file", "produced_at",
 })
 
-# Fields whose value must be a valid float (NaN/None → validation error for core OHLCV).
-# dividends and stock_splits are allowed to be 0.0 on non-event days → not null-checked.
-# stochk/stochd can be null for the first few rows before the indicator warms up → nullable.
 NUMERIC_FIELDS: frozenset[str] = frozenset({
     "open", "high", "low", "close", "volume",
 })
 
-# Nullable numeric fields — present in schema but allowed to be None/null.
 NULLABLE_NUMERIC_FIELDS: frozenset[str] = frozenset({
     "dividends", "stock_splits", "stochk_14_3_3", "stochd_14_3_3",
 })
-
-
-# ── Live Dashboard ────────────────────────────────────────────────────────────
-
-class ConsumerDashboard:
-    """
-    Rewrites a fixed block of terminal lines so the screen doesn't scroll.
-    Shows consumed/valid/invalid counts, throughput, and last-seen ticker.
-    """
-
-    BAR_WIDTH = 30
-
-    def __init__(self) -> None:
-        self.total_consumed = 0
-        self.total_valid    = 0
-        self.total_invalid  = 0
-        self.total_batches  = 0
-        self.last_ticker    = "—"
-        self.last_date      = "—"
-        self.last_close     = "—"
-        self.start_time     = time.time()
-        self._lines         = 0
-
-    def update(
-        self,
-        consumed: int,
-        valid: int,
-        invalid: int,
-        last_ticker: str = "—",
-        last_date: str   = "—",
-        last_close: str  = "—",
-    ) -> None:
-        self.total_consumed += consumed
-        self.total_valid    += valid
-        self.total_invalid  += invalid
-        self.total_batches  += 1
-        self.last_ticker = last_ticker
-        self.last_date   = last_date
-        self.last_close  = last_close
-
-    def _bar(self, frac: float, ok: bool = True) -> str:
-        filled = int(self.BAR_WIDTH * frac)
-        ch = "█" if ok else "▓"
-        return ch * filled + "░" * (self.BAR_WIDTH - filled)
-
-    def render(self) -> None:
-        elapsed    = max(time.time() - self.start_time, 1e-9)
-        msg_s      = self.total_consumed / elapsed
-        valid_pct  = self.total_valid   / max(self.total_consumed, 1)
-        bad_pct    = self.total_invalid / max(self.total_consumed, 1)
-
-        lines = [
-            "",
-            "  ╔══════════════════════════════════════════════════════════╗",
-            "  ║          📥  US STOCKS KAFKA CONSUMER  📥               ║",
-            "  ╠══════════════════════════════════════════════════════════╣",
-            f"  ║  Consumed : {self.total_consumed:>12,}  │  Batches: {self.total_batches:<6}             ║",
-            f"  ║  Valid    : {self.total_valid:>12,}  [{self._bar(valid_pct, ok=True)}] {valid_pct*100:5.1f}%  ║",
-            f"  ║  Invalid  : {self.total_invalid:>12,}  [{self._bar(bad_pct,  ok=False)}] {bad_pct*100:5.1f}%  ║",
-            f"  ║  Speed    : {msg_s:>10,.0f} msg/s  │  Elapsed: {int(elapsed//60):02d}:{int(elapsed%60):02d}              ║",
-            f"  ║  Last     : ticker={self.last_ticker:<6}  date={self.last_date}  close={str(self.last_close):<10}  ║",
-            "  ╚══════════════════════════════════════════════════════════╝",
-            "",
-        ]
-
-        if self._lines:
-            sys.stdout.write(f"\033[{self._lines}A")
-
-        sys.stdout.write("\n".join(lines) + "\n")
-        sys.stdout.flush()
-        self._lines = len(lines)
 
 
 # ── Schema validation ─────────────────────────────────────────────────────────
@@ -159,28 +82,15 @@ class ValidationResult:
 def validate_event(event: dict[str, Any]) -> ValidationResult:
     """
     Validate one event against the canonical StockHistory schema.
-
-    Rules
-    ─────
-    1. All REQUIRED_FIELDS keys must be present.
-    2. Core OHLCV fields (NUMERIC_FIELDS) must be non-null valid floats.
-    3. Nullable indicator fields (NULLABLE_NUMERIC_FIELDS) may be null but,
-       when present, must be valid floats (not strings like "nan").
-    4. date must parse as YYYY-MM-DD.
-    5. high >= low (sanity check).
-    6. open, high, low, close must be > 0.
-    7. volume must be >= 0.
     """
     errors: list[str] = []
     event_id = event.get("event_id")
     ticker   = event.get("ticker")
 
-    # ── 1. Required keys ──────────────────────────────────────────────────
     missing = REQUIRED_FIELDS - event.keys()
     if missing:
         errors.append(f"Missing fields: {sorted(missing)}")
 
-    # ── 2. Core OHLCV — must be non-null valid floats ─────────────────────
     for col in NUMERIC_FIELDS:
         val = event.get(col)
         if val is None:
@@ -191,17 +101,15 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
         except (TypeError, ValueError):
             errors.append(f"Non-numeric {col}={val!r}")
 
-    # ── 3. Nullable numerics — when present must be valid floats ──────────
     for col in NULLABLE_NUMERIC_FIELDS:
         val = event.get(col)
         if val is None:
-            continue   # null is fine for indicator warm-up rows
+            continue
         try:
             float(val)
         except (TypeError, ValueError):
             errors.append(f"Non-numeric {col}={val!r}")
 
-    # ── 4. Date format ────────────────────────────────────────────────────
     date_str = event.get("date")
     if date_str:
         try:
@@ -211,7 +119,6 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
     else:
         errors.append("date is null or missing")
 
-    # ── 5 & 6. Price sanity ───────────────────────────────────────────────
     try:
         high  = float(event.get("high",  0) or 0)
         low   = float(event.get("low",   0) or 0)
@@ -225,7 +132,6 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
     except (TypeError, ValueError):
         pass
 
-    # ── 7. Volume ─────────────────────────────────────────────────────────
     try:
         vol = float(event.get("volume", 0) or 0)
         if vol < 0:
@@ -241,7 +147,7 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
     )
 
 
-# ── Micro-batch stats ─────────────────────────────────────────────────────────
+# ── Micro-batch processing ────────────────────────────────────────────────────
 
 @dataclass
 class BatchStats:
@@ -280,7 +186,7 @@ def process_micro_batch(
         try:
             event: dict = json.loads(msg.value().decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            log.warning("Batch %d | Cannot decode message: %s", batch_num, exc)
+            log.warning("batch=%d | Cannot decode message: %s", batch_num, exc)
             stats.invalid_msgs += 1
             global_stats["invalid"] += 1
             continue
@@ -299,25 +205,23 @@ def process_micro_batch(
             if live:
                 stochk = event.get("stochk_14_3_3")
                 stochd = event.get("stochd_14_3_3")
-                print(
-                    f"  ✅ [{result.event_id:<8}] "
-                    f"{ticker:<6} "
-                    f"{event.get('date')}  "
-                    f"O={event.get('open'):<9}  "
-                    f"H={event.get('high'):<9}  "
-                    f"L={event.get('low'):<9}  "
-                    f"C={event.get('close'):<9}  "
-                    f"Vol={event.get('volume'):<12}  "
-                    f"Div={event.get('dividends'):<6}  "
-                    f"Split={event.get('stock_splits'):<5}  "
-                    f"K={f'{stochk:.2f}' if stochk is not None else 'n/a':<7}  "
-                    f"D={f'{stochd:.2f}' if stochd is not None else 'n/a'}"
+                log.info(
+                    "  OK  id=%-8s  ticker=%-6s  date=%s  "
+                    "O=%-9s H=%-9s L=%-9s C=%-9s  vol=%-12s  "
+                    "K=%s  D=%s",
+                    result.event_id, ticker,
+                    event.get("date"),
+                    event.get("open"), event.get("high"),
+                    event.get("low"),  event.get("close"),
+                    event.get("volume"),
+                    f"{stochk:.2f}" if stochk is not None else "n/a",
+                    f"{stochd:.2f}" if stochd is not None else "n/a",
                 )
         else:
             stats.invalid_msgs += 1
             global_stats["invalid"] += 1
             log.warning(
-                "INVALID event_id=%s ticker=%s | %s",
+                "INVALID  event_id=%s  ticker=%s | %s",
                 result.event_id, ticker, " | ".join(result.errors),
             )
 
@@ -327,15 +231,24 @@ def process_micro_batch(
     return stats
 
 
-def log_batch_summary(stats: BatchStats) -> None:
-    pct_valid = (stats.valid_msgs / max(stats.total_msgs, 1)) * 100
+def log_batch_summary(stats: BatchStats, global_stats: dict) -> None:
+    pct_valid  = stats.valid_msgs   / max(stats.total_msgs, 1) * 100
+    g_total    = global_stats["total"]
+    g_valid    = global_stats["valid"]
+    g_invalid  = global_stats["invalid"]
+    g_pct      = g_valid / max(g_total, 1) * 100
+
     log.info(
-        "Batch %4d [%s] | msgs=%d  valid=%d (%.0f%%)  invalid=%d  "
-        "tickers=%d  %.2fs  %.0f msg/s",
+        "batch=%4d [%-8s]  msgs=%3d  valid=%3d (%5.1f%%)  invalid=%2d  "
+        "tickers=%d  %.2fs  %7.0f msg/s  |  "
+        "total=%d  valid=%d (%.1f%%)  invalid=%d  "
+        "last=%s %s close=%s",
         stats.batch_num, stats.trigger,
         stats.total_msgs, stats.valid_msgs, pct_valid,
         stats.invalid_msgs, len(stats.tickers_seen),
         stats.elapsed, stats.throughput,
+        g_total, g_valid, g_pct, g_invalid,
+        stats.last_ticker, stats.last_date, stats.last_close,
     )
 
 
@@ -343,7 +256,7 @@ def log_global_summary(global_stats: dict) -> None:
     total   = global_stats["total"]
     valid   = global_stats["valid"]
     invalid = global_stats["invalid"]
-    pct     = (valid / max(total, 1)) * 100
+    pct     = valid / max(total, 1) * 100
 
     log.info("=" * 62)
     log.info("  GLOBAL SUMMARY")
@@ -385,7 +298,7 @@ def wait_for_topic(bootstrap: str, topic: str) -> None:
         try:
             cluster_meta = admin.list_topics(timeout=10)
             if topic in cluster_meta.topics:
-                log.info("Topic '%s' confirmed on broker. ✓", topic)
+                log.info("Topic '%s' confirmed on broker.", topic)
                 return
         except Exception as exc:
             log.warning("AdminClient error on attempt %d: %s", attempt, exc)
@@ -440,8 +353,10 @@ def main() -> None:
 
     log.info("=" * 62)
     log.info("  US Stocks Kafka Consumer  [PARALLEL REAL-TIME MODE]")
-    log.info("  Broker: %s  |  Topic: %s  |  Group: %s", bootstrap, topic, group)
-    log.info("  Batch size: %d  |  Max wait: %d ms", args.batch_size, args.max_wait_ms)
+    log.info("  Broker     : %s", bootstrap)
+    log.info("  Topic      : %s", topic)
+    log.info("  Group      : %s", group)
+    log.info("  Batch size : %d  |  Max wait: %d ms", args.batch_size, args.max_wait_ms)
     log.info("=" * 62)
 
     signal.signal(signal.SIGINT,  _handle_signal)
@@ -450,15 +365,11 @@ def main() -> None:
     wait_for_topic(bootstrap, topic)
     consumer = build_consumer(bootstrap, group, topic)
 
-    dash        = ConsumerDashboard()
     global_stats: dict = {"total": 0, "valid": 0, "invalid": 0, "batches": 0}
     batch_num   = 0
     buffer:  list[Message] = []
     max_wait_s  = args.max_wait_ms / 1000.0
     batch_start = time.monotonic()
-
-    # Initial render
-    dash.render()
 
     def _flush_buffer(trigger: str) -> None:
         nonlocal batch_num, buffer, batch_start
@@ -467,20 +378,8 @@ def main() -> None:
             return
         batch_num += 1
         stats = process_micro_batch(buffer, batch_num, trigger, global_stats, args.live)
-        log_batch_summary(stats)
+        log_batch_summary(stats, global_stats)
         consumer.commit(asynchronous=False)
-
-        # Update and re-render the dashboard
-        dash.update(
-            consumed    = stats.total_msgs,
-            valid       = stats.valid_msgs,
-            invalid     = stats.invalid_msgs,
-            last_ticker = stats.last_ticker,
-            last_date   = stats.last_date,
-            last_close  = stats.last_close,
-        )
-        dash.render()
-
         buffer      = []
         batch_start = time.monotonic()
 

@@ -60,53 +60,24 @@ SPEED_FACTOR     = 1.0
 QUEUE_MAXSIZE    = 3
 _SENTINEL        = object()
 
-# Only stream files whose path (lower-cased) starts with this prefix.
-# The dataset also contains Data/Congress/ — those are skipped.
 STOCK_PATH_PREFIX = "data/stockhistory"
-
-# Real column names in every StockHistory CSV (after lower-casing):
-#   date, open, high, low, close, volume, dividends, stock_splits,
-#   stochk_14_3_3, stochd_14_3_3
-# Ticker is NOT a column — it comes from the filename (e.g. AAPL.csv → AAPL).
-#
-# A file is accepted only if it has ALL of these core columns.
 REQUIRED_STOCK_COLS = {"date", "open", "high", "low", "close", "volume"}
 
 
-# ── Dashboard helpers ─────────────────────────────────────────────────────────
+# ── Progress state (simple counters, no terminal tricks) ──────────────────────
 
-class Dashboard:
-    """
-    Thread-safe live progress dashboard printed to the terminal.
-    Rewrites a fixed block of lines so the terminal doesn't scroll.
-    """
-
-    BAR_WIDTH = 30
-
+class _Stats:
     def __init__(self, total_files: int) -> None:
         self.total_files   = total_files
         self.done_files    = 0
-        self.current_file  = "—"
-        self.total_rows    = 0        # rows in current file
-        self.produced_rows = 0        # rows sent so far (across all files)
-        self.total_events  = 0        # running total events produced
         self.skipped_files = 0
+        self.total_events  = 0
         self.start_time    = time.time()
         self._lock         = threading.Lock()
-        self._lines        = 0        # how many lines the last render used
-
-    # ── state updates (called from main thread) ────────────────────────────
-
-    def set_file(self, fname: str, nrows: int) -> None:
-        with self._lock:
-            self.current_file  = os.path.basename(fname)
-            self.total_rows    = nrows
-            self.produced_rows = 0
 
     def add_events(self, n: int) -> None:
         with self._lock:
-            self.produced_rows += n
-            self.total_events  += n
+            self.total_events += n
 
     def file_done(self) -> None:
         with self._lock:
@@ -116,44 +87,13 @@ class Dashboard:
         with self._lock:
             self.skipped_files += 1
 
-    # ── rendering ─────────────────────────────────────────────────────────
+    def elapsed_str(self) -> str:
+        e = int(time.time() - self.start_time)
+        return f"{e // 60:02d}:{e % 60:02d}"
 
-    def _bar(self, frac: float) -> str:
-        filled = int(self.BAR_WIDTH * frac)
-        return "█" * filled + "░" * (self.BAR_WIDTH - filled)
-
-    def render(self) -> None:
-        with self._lock:
-            elapsed   = max(time.time() - self.start_time, 1e-9)
-            ev_s      = self.total_events / elapsed
-            file_pct  = self.done_files / max(self.total_files, 1)
-            row_pct   = self.produced_rows / max(self.total_rows, 1)
-            remaining = self.total_files - self.done_files
-
-            lines = [
-                "",
-                "  ╔══════════════════════════════════════════════════════════╗",
-                "  ║          📈  US STOCKS KAFKA PRODUCER  📈               ║",
-                "  ╠══════════════════════════════════════════════════════════╣",
-                f"  ║  Files   : {self.done_files:>4} / {self.total_files:<4} done  "
-                f"│  Skipped : {self.skipped_files:<4}  │  Remaining: {remaining:<4}  ║",
-                f"  ║  Current : {self.current_file[:42]:<42}         ║",
-                f"  ║  File    : [{self._bar(row_pct)}] {row_pct*100:5.1f}%  ║",
-                f"  ║  Overall : [{self._bar(file_pct)}] {file_pct*100:5.1f}%  ║",
-                f"  ║  Events  : {self.total_events:>12,}  │  Speed: {ev_s:>8,.0f} ev/s  │  "
-                f"Elapsed: {int(elapsed//60):02d}:{int(elapsed%60):02d}  ║",
-                "  ╚══════════════════════════════════════════════════════════╝",
-                "",
-            ]
-
-        # Move cursor up to overwrite previous render
-        if self._lines:
-            sys.stdout.write(f"\033[{self._lines}A")
-
-        output = "\n".join(lines)
-        sys.stdout.write(output + "\n")
-        sys.stdout.flush()
-        self._lines = len(lines)
+    def ev_per_s(self) -> float:
+        e = max(time.time() - self.start_time, 1e-9)
+        return self.total_events / e
 
 
 # ── Kaggle auth ───────────────────────────────────────────────────────────────
@@ -264,16 +204,10 @@ def _normalise_df(df: pd.DataFrame, filename: str) -> pd.DataFrame:
 
 
 def _is_stock_file(df: pd.DataFrame) -> bool:
-    """
-    Return True only when the DataFrame has ALL required stock columns.
-    Columns are already lower-cased by _normalise_df at this point.
-    This rejects Congress/transaction files which lack open/high/low/close/volume.
-    """
     return REQUIRED_STOCK_COLS.issubset(set(df.columns))
 
 
 def download_single_csv(filename: str, dataset: str = KAGGLE_DATASET) -> pd.DataFrame:
-    # ── Strategy 1: kaggle CLI ────────────────────────────────────────────
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             result = subprocess.run(
@@ -302,7 +236,6 @@ def download_single_csv(filename: str, dataset: str = KAGGLE_DATASET) -> pd.Data
     except Exception as cli_err:
         log.warning("kaggle CLI download failed for %s (%s) — trying REST …", filename, cli_err)
 
-    # ── Strategy 2: REST download endpoint ───────────────────────────────
     username, key = _kaggle_auth()
     url = f"{KAGGLE_API_BASE}/datasets/download/{dataset}/{filename}"
 
@@ -332,21 +265,19 @@ def _download_worker(
     csv_files: list[str],
     ticker_filter: Optional[str],
     file_queue: "queue.Queue",
-    dashboard: Dashboard,
+    stats: _Stats,
 ) -> None:
     for fname in csv_files:
         normalised = fname.lower().replace("\\", "/")
 
-        # ── Guard 1: path prefix — only StockHistory files ───────────────
         if not normalised.startswith(STOCK_PATH_PREFIX):
-            log.info("[DL] Skipping non-StockHistory file: %s", fname)
-            dashboard.file_skipped()
+            log.debug("Skipping non-StockHistory file: %s", fname)
+            stats.file_skipped()
             continue
 
-        # ── Guard 2: ticker filter ────────────────────────────────────────
         ticker_hint = os.path.splitext(os.path.basename(fname))[0].upper()
         if ticker_filter and ticker_hint != ticker_filter.upper():
-            dashboard.file_skipped()
+            stats.file_skipped()
             continue
 
         log.info("[DL] Downloading %s …", fname)
@@ -354,107 +285,65 @@ def _download_worker(
             df = download_single_csv(fname)
             if df.empty:
                 log.warning("[DL] %s is empty — skipping", fname)
-                dashboard.file_skipped()
+                stats.file_skipped()
                 continue
 
-            # ── Guard 3: required column check ───────────────────────────
-            # Rejects any non-stock file regardless of path casing.
-            # StockHistory files have: date, open, high, low, close, volume,
-            # dividends, stock_splits, stochk_14_3_3, stochd_14_3_3
-            # Congress files have completely different columns → rejected here.
             if not _is_stock_file(df):
                 log.warning(
                     "[DL] %s missing required stock columns (found: %s) — skipping",
                     fname, list(df.columns),
                 )
-                dashboard.file_skipped()
+                stats.file_skipped()
                 continue
 
             date_cols = [c for c in df.columns if c in ("date", "timestamp", "time")]
             if date_cols:
                 df = df.sort_values(date_cols[0], ascending=True)
 
-            log.info("[DL] ✓ %s  (%d rows) → queued", fname, len(df))
+            log.info("[DL] Ready  file=%-30s  rows=%d", os.path.basename(fname), len(df))
             file_queue.put((fname, df))
 
         except Exception as exc:
             log.warning("[DL] Skipping %s — %s", fname, exc)
-            dashboard.file_skipped()
+            stats.file_skipped()
 
     file_queue.put(_SENTINEL)
-    log.info("[DL] All files downloaded. Thread exiting.")
+    log.info("[DL] All files queued. Download thread done.")
 
 
 # ── Event schema ──────────────────────────────────────────────────────────────
-#
-# Real StockHistory CSV columns (after _normalise_df lower-cases them):
-#   date            – trading date  (YYYY-MM-DD)
-#   open            – opening price
-#   high            – intraday high
-#   low             – intraday low
-#   close           – closing price
-#   volume          – shares traded
-#   dividends       – cash dividend paid on this date (0.0 when none)
-#   stock_splits    – split ratio on this date        (0.0 when none)
-#   stochk_14_3_3   – Stochastic %K (14,3,3)
-#   stochd_14_3_3   – Stochastic %D (14,3,3)
-#
-# Ticker is NOT in the CSV — it is derived from the filename.
-# _normalise_df already inserts it as the "ticker" column.
 
 def row_to_event(row: pd.Series, source_file: str, event_id: int) -> dict:
-    """
-    Convert one DataFrame row (already normalised by _normalise_df) into
-    the canonical JSON event that is written to Kafka.
-
-    All numeric fields use _safe() so NaN / None become JSON null rather
-    than the string "nan" or raising a serialisation error.
-    """
-
     def _safe(key: str) -> Optional[float]:
-        """Return float value or None — never NaN, never raises."""
         val = row.get(key)
         if val is None:
             return None
-        # pandas represents missing numerics as float NaN
         try:
             f = float(val)
             return None if pd.isna(f) else f
         except (TypeError, ValueError):
             return None
 
-    # Date column is always "date" after normalisation.
-    # Truncate to YYYY-MM-DD in case the raw value includes a time component.
     raw_date = row.get("date")
     date_val: Optional[str] = None
     if raw_date is not None and str(raw_date) not in ("", "nan", "NaT"):
         date_val = str(raw_date)[:10]
 
-    # Ticker was inserted by _normalise_df (from the filename, e.g. AAPL.csv → AAPL)
     ticker = str(row.get("ticker", "UNKNOWN")).upper()
 
     return {
-        # ── Identity ──────────────────────────────────────────────────────
         "event_id":       event_id,
         "ticker":         ticker,
         "date":           date_val,
-
-        # ── Core OHLCV ────────────────────────────────────────────────────
         "open":           _safe("open"),
         "high":           _safe("high"),
         "low":            _safe("low"),
         "close":          _safe("close"),
         "volume":         _safe("volume"),
-
-        # ── Corporate actions ─────────────────────────────────────────────
-        "dividends":      _safe("dividends"),      # 0.0 on non-dividend days
-        "stock_splits":   _safe("stock_splits"),   # 0.0 on non-split days
-
-        # ── Technical indicators ──────────────────────────────────────────
+        "dividends":      _safe("dividends"),
+        "stock_splits":   _safe("stock_splits"),
         "stochk_14_3_3":  _safe("stochk_14_3_3"),
         "stochd_14_3_3":  _safe("stochd_14_3_3"),
-
-        # ── Pipeline metadata ─────────────────────────────────────────────
         "source_file":    source_file,
         "produced_at":    datetime.utcnow().isoformat() + "Z",
     }
@@ -511,31 +400,33 @@ def main() -> None:
 
     log.info("=" * 62)
     log.info("  US Stocks Kafka Producer  [PARALLEL REAL-TIME MODE]")
-    log.info("  Broker: %s  |  Topic: %s", bootstrap, topic)
-    log.info("  Speed: %.1fx  |  Batch: %d rows", args.speed, args.batch_size)
+    log.info("  Broker  : %s", bootstrap)
+    log.info("  Topic   : %s", topic)
+    log.info("  Speed   : %.1fx  |  Batch: %d rows", args.speed, args.batch_size)
     log.info("=" * 62)
 
     csv_files = list_kaggle_csv_files()
 
-    # Count only stock files for the dashboard total
     stock_files = [
         f for f in csv_files
         if f.lower().replace("\\", "/").startswith(STOCK_PATH_PREFIX)
     ]
-    dashboard = Dashboard(total_files=len(stock_files))
+    total_stock = len(stock_files)
     log.info("Stock files to stream: %d  (skipping %d non-stock files)",
-             len(stock_files), len(csv_files) - len(stock_files))
+             total_stock, len(csv_files) - total_stock)
+
+    stats = _Stats(total_files=total_stock)
 
     file_queue: "queue.Queue" = queue.Queue(maxsize=QUEUE_MAXSIZE)
     dl_thread = threading.Thread(
         target=_download_worker,
-        args=(csv_files, args.ticker, file_queue, dashboard),
+        args=(csv_files, args.ticker, file_queue, stats),
         daemon=True,
         name="kaggle-downloader",
     )
     dl_thread.start()
 
-    producer    = build_producer(bootstrap)
+    producer = build_producer(bootstrap)
     delay_per_batch = max(
         0.0,
         (args.batch_size / 252 / 6.5 / 3600) / max(args.speed, 0.01),
@@ -546,9 +437,6 @@ def main() -> None:
     event_id      = 0
     start_wall    = time.time()
 
-    # Initial dashboard render
-    dashboard.render()
-
     try:
         while True:
             item = file_queue.get()
@@ -558,10 +446,20 @@ def main() -> None:
                 break
 
             fname, df = item
-            dashboard.set_file(fname, len(df))
-            dashboard.render()
+            basename  = os.path.basename(fname)
+            file_rows = len(df)
+            file_events = 0
+            file_start  = time.time()
+
+            log.info(
+                "START  file=%-12s  rows=%d  "
+                "overall=%d/%d done  total_events=%d",
+                basename, file_rows,
+                stats.done_files, total_stock, total_events,
+            )
 
             batch: list[dict] = []
+            batch_num_in_file = 0
 
             for _, row in df.iterrows():
                 event = row_to_event(row, fname, event_id)
@@ -578,18 +476,29 @@ def main() -> None:
                         )
                     producer.poll(0)
 
-                    total_events  += len(batch)
-                    total_batches += 1
-                    dashboard.add_events(len(batch))
-                    batch = []
+                    total_events    += len(batch)
+                    total_batches   += 1
+                    file_events     += len(batch)
+                    batch_num_in_file += 1
+                    stats.add_events(len(batch))
 
-                    # Refresh dashboard every batch
-                    dashboard.render()
+                    file_elapsed = time.time() - file_start
+                    file_pct     = file_events / max(file_rows, 1) * 100
+                    ev_s         = file_events / max(file_elapsed, 1e-9)
+
+                    log.info(
+                        "  batch=%3d  sent=%5d/%5d (%5.1f%%)  "
+                        "ev/s=%6.0f  elapsed=%s  total_events=%d",
+                        batch_num_in_file, file_events, file_rows, file_pct,
+                        ev_s, stats.elapsed_str(), total_events,
+                    )
+
+                    batch = []
 
                     if delay_per_batch > 0:
                         time.sleep(delay_per_batch)
 
-            # Flush partial last batch
+            # Flush remaining partial batch
             if batch:
                 for ev in batch:
                     producer.produce(
@@ -601,11 +510,18 @@ def main() -> None:
                 producer.poll(0)
                 total_events  += len(batch)
                 total_batches += 1
-                dashboard.add_events(len(batch))
+                file_events   += len(batch)
+                stats.add_events(len(batch))
 
-            dashboard.file_done()
-            dashboard.render()
-            log.info("  ✓ Finished producing %s", fname)
+            stats.file_done()
+            file_elapsed = time.time() - file_start
+            log.info(
+                "DONE   file=%-12s  events=%d  time=%.1fs  "
+                "ev/s=%.0f  overall=%d/%d  grand_total=%d",
+                basename, file_events, file_elapsed,
+                file_events / max(file_elapsed, 1e-9),
+                stats.done_files, total_stock, total_events,
+            )
 
     except KeyboardInterrupt:
         log.info("Interrupted by user — flushing …")
@@ -615,10 +531,6 @@ def main() -> None:
     finally:
         producer.flush(timeout=30)
         elapsed = time.time() - start_wall
-
-        # Final dashboard
-        dashboard.render()
-
         log.info("=" * 62)
         log.info("  PRODUCER DONE")
         log.info("  Total events  : %d", total_events)
