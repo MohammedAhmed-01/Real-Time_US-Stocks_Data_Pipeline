@@ -1,15 +1,29 @@
 """
-Kafka Consumer — US Stock Dataset (validation & micro-batch processing)
-=======================================================================
+Kafka Consumer — US Stock Dataset  [PARALLEL REAL-TIME MODE]
+============================================================
 M1 · Data & Kafka  |  Real-Time US Stocks Data Pipeline
 
-Consumes canonical JSON events from the Kafka topic, processes them in
-configurable micro-batches to simulate real-time ingestion, validates
-the schema, and prints a live summary.  This consumer is the handover
-validation script that M2 (Spark) will replace with Structured Streaming.
+This consumer is designed to run IN PARALLEL with the producer.
+It processes messages the moment they arrive — it does NOT wait
+for the producer to finish.
+
+Micro-batch flushing is DUAL-TRIGGERED:
+  • Size trigger  — flush when buffer reaches --batch-size messages
+  • Time trigger  — flush every --max-wait-ms milliseconds even if
+                    the buffer is not full (keeps latency low during
+                    periods of slow ingest)
+
+This dual strategy gives you true near-real-time processing:
+  producer writes row 1 → Kafka → consumer sees it in < max-wait-ms
+
+Architecture:
+  Kafka topic ─▶ poll() ─▶ buffer ─▶ [size OR time trigger] ─▶ validate ─▶ stats
 
 Usage:
-    python consumer.py [--batch-size INT] [--timeout FLOAT] [--group GROUP]
+    python consumer.py [--batch-size INT] [--max-wait-ms INT]
+                       [--timeout FLOAT] [--group GROUP] [--live]
+
+    --live        print every individual message to stdout (verbose)
 
 Environment variables (or .env file):
     KAFKA_BOOTSTRAP  – Kafka broker(s), default localhost:9092
@@ -19,6 +33,7 @@ Environment variables (or .env file):
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -41,23 +56,20 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-DEFAULT_TOPIC    = "us-stocks-raw"
-DEFAULT_BROKER   = "localhost:9092"
-DEFAULT_GROUP    = "m1-validation-group"
-MICRO_BATCH_SIZE = 100          # messages per processing micro-batch
-POLL_TIMEOUT     = 1.0          # seconds to wait for a message
+DEFAULT_TOPIC       = "us-stocks-raw"
+DEFAULT_BROKER      = "localhost:9092"
+DEFAULT_GROUP       = "m1-validation-group"
+MICRO_BATCH_SIZE    = 100       # flush batch when this many messages buffered
+MAX_WAIT_MS         = 2000      # flush batch after this many ms even if not full
+POLL_TIMEOUT        = 0.5       # seconds per poll() call (kept short for liveness)
 
-# FIX: 60 retries × 5 s = 5-minute window; gives kafka-init's 30 s sleep
-#      plus topic propagation plenty of headroom.
 TOPIC_RETRY_ATTEMPTS = 60
-TOPIC_RETRY_DELAY    = 5        # seconds between retries
+TOPIC_RETRY_DELAY    = 5
 
-# Required canonical fields that every event must contain
 REQUIRED_FIELDS: frozenset[str] = frozenset({
     "ticker", "date", "open", "high", "low", "close", "volume",
     "produced_at", "event_id",
 })
-
 NUMERIC_FIELDS: frozenset[str] = frozenset({
     "open", "high", "low", "close", "volume",
 })
@@ -67,7 +79,6 @@ NUMERIC_FIELDS: frozenset[str] = frozenset({
 
 @dataclass
 class ValidationResult:
-    """Outcome of validating a single event."""
     valid:    bool
     event_id: Optional[int]
     ticker:   Optional[str]
@@ -75,26 +86,14 @@ class ValidationResult:
 
 
 def validate_event(event: dict[str, Any]) -> ValidationResult:
-    """
-    Validate a canonical stock event against the agreed schema.
-
-    Rules:
-    - All REQUIRED_FIELDS must be present and non-null.
-    - NUMERIC_FIELDS must be parseable as float.
-    - high >= low  (basic sanity check).
-    - date must be a parseable YYYY-MM-DD string.
-    """
     errors: list[str] = []
-
     event_id = event.get("event_id")
     ticker   = event.get("ticker")
 
-    # 1. Required fields present
     missing = REQUIRED_FIELDS - event.keys()
     if missing:
         errors.append(f"Missing fields: {sorted(missing)}")
 
-    # 2. Numeric fields are actual numbers
     for col in NUMERIC_FIELDS:
         val = event.get(col)
         if val is None:
@@ -105,7 +104,6 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
         except (TypeError, ValueError):
             errors.append(f"Non-numeric value for {col}: {val!r}")
 
-    # 3. Date parseable
     date_str = event.get("date")
     if date_str:
         try:
@@ -115,7 +113,6 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
     else:
         errors.append("date is null or missing")
 
-    # 4. High >= Low sanity
     try:
         high = float(event.get("high", 0) or 0)
         low  = float(event.get("low",  0) or 0)
@@ -132,17 +129,17 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
     )
 
 
-# ── Micro-batch processor ─────────────────────────────────────────────────────
+# ── Micro-batch stats ─────────────────────────────────────────────────────────
 
 @dataclass
 class BatchStats:
-    """Accumulated statistics for one micro-batch."""
-    batch_num:     int
-    total_msgs:    int = 0
-    valid_msgs:    int = 0
-    invalid_msgs:  int = 0
-    tickers_seen:  set = field(default_factory=set)
-    start_time:    float = field(default_factory=time.time)
+    batch_num:    int
+    total_msgs:   int   = 0
+    valid_msgs:   int   = 0
+    invalid_msgs: int   = 0
+    tickers_seen: set   = field(default_factory=set)
+    start_time:   float = field(default_factory=time.time)
+    trigger:      str   = "?"    # "size" or "time"
 
     @property
     def elapsed(self) -> float:
@@ -156,10 +153,12 @@ class BatchStats:
 def process_micro_batch(
     messages: list[Message],
     batch_num: int,
+    trigger: str,
     global_stats: dict,
+    live: bool = False,
 ) -> BatchStats:
-    """Process a micro-batch of Kafka messages: deserialise, validate, tally."""
-    stats = BatchStats(batch_num=batch_num)
+    """Deserialise, validate, and tally a micro-batch of Kafka messages."""
+    stats = BatchStats(batch_num=batch_num, trigger=trigger)
 
     for msg in messages:
         stats.total_msgs += 1
@@ -179,6 +178,16 @@ def process_micro_batch(
         if result.valid:
             stats.valid_msgs += 1
             global_stats["valid"] += 1
+
+            # --live mode: print each valid message as it arrives
+            if live:
+                print(
+                    f"  ✅ event_id={result.event_id:<8} "
+                    f"ticker={ticker:<6} "
+                    f"date={event.get('date')}  "
+                    f"close={event.get('close')}  "
+                    f"volume={event.get('volume')}"
+                )
         else:
             stats.invalid_msgs += 1
             global_stats["invalid"] += 1
@@ -196,9 +205,10 @@ def process_micro_batch(
 def log_batch_summary(stats: BatchStats) -> None:
     pct_valid = (stats.valid_msgs / max(stats.total_msgs, 1)) * 100
     log.info(
-        "Batch %4d | msgs=%d  valid=%d (%.0f%%)  invalid=%d  "
-        "tickers=%d  elapsed=%.2fs  throughput=%.0f msg/s",
+        "Batch %4d [%s-triggered] | msgs=%d  valid=%d (%.0f%%)  "
+        "invalid=%d  tickers=%d  %.2fs  %.0f msg/s",
         stats.batch_num,
+        stats.trigger,
         stats.total_msgs,
         stats.valid_msgs,
         pct_valid,
@@ -215,27 +225,27 @@ def log_global_summary(global_stats: dict) -> None:
     invalid = global_stats["invalid"]
     pct     = (valid / max(total, 1)) * 100
 
-    log.info("=" * 60)
-    log.info("GLOBAL SUMMARY")
+    log.info("=" * 62)
+    log.info("  GLOBAL SUMMARY")
     log.info("  Total batches : %d", global_stats["batches"])
     log.info("  Total messages: %d", total)
     log.info("  Valid         : %d  (%.1f%%)", valid, pct)
     log.info("  Invalid       : %d  (%.1f%%)", invalid, 100 - pct)
-    log.info("=" * 60)
+    log.info("=" * 62)
 
 
-# ── Kafka consumer ────────────────────────────────────────────────────────────
+# ── Kafka helpers ─────────────────────────────────────────────────────────────
 
 def build_consumer(bootstrap_servers: str, group_id: str, topic: str) -> Consumer:
     conf = {
-        "bootstrap.servers":        bootstrap_servers,
-        "group.id":                 group_id,
-        "auto.offset.reset":        "earliest",
-        "enable.auto.commit":       False,
-        "max.poll.interval.ms":     300_000,
-        "session.timeout.ms":       30_000,
-        "fetch.min.bytes":          1,
-        "fetch.wait.max.ms":        500,
+        "bootstrap.servers":    bootstrap_servers,
+        "group.id":             group_id,
+        "auto.offset.reset":    "earliest",
+        "enable.auto.commit":   False,
+        "max.poll.interval.ms": 300_000,
+        "session.timeout.ms":   30_000,
+        "fetch.min.bytes":      1,
+        "fetch.wait.max.ms":    500,
     }
     consumer = Consumer(conf)
     consumer.subscribe([topic])
@@ -243,51 +253,14 @@ def build_consumer(bootstrap_servers: str, group_id: str, topic: str) -> Consume
     return consumer
 
 
-# ── Graceful shutdown ─────────────────────────────────────────────────────────
-
-_running = True
-
-
-def _handle_signal(signum, _frame) -> None:
-    global _running
-    log.info("Signal %d received — shutting down …", signum)
-    _running = False
-
-
-# ── Topic wait ────────────────────────────────────────────────────────────────
-
-import argparse
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="US Stocks Kafka Consumer (validation)")
-    p.add_argument("--batch-size", type=int,   default=MICRO_BATCH_SIZE)
-    p.add_argument("--timeout",    type=float, default=POLL_TIMEOUT)
-    p.add_argument("--group",      type=str,   default=None)
-    p.add_argument("--topic",      type=str,   default=None)
-    return p.parse_args()
-
-
 def wait_for_topic(bootstrap: str, topic: str) -> None:
-    """
-    Block until the topic exists on the broker.
-
-    FIX summary vs original:
-      - No upfront sleep (kafka-init now sleeps 30 s itself before creating
-        topics, so by the time this consumer starts the topics either exist
-        or will exist very soon).
-      - Retries raised to 60 × 5 s = 5-minute total window.
-      - AdminClient re-created each attempt to avoid stale cached metadata.
-    """
     from confluent_kafka.admin import AdminClient
 
     log.info(
         "Waiting for topic '%s' to appear (up to %d s) …",
         topic, TOPIC_RETRY_ATTEMPTS * TOPIC_RETRY_DELAY,
     )
-
     for attempt in range(1, TOPIC_RETRY_ATTEMPTS + 1):
-        # Re-create AdminClient each loop — avoids stale metadata cache
         admin = AdminClient({"bootstrap.servers": bootstrap})
         try:
             cluster_meta = admin.list_topics(timeout=10)
@@ -304,10 +277,38 @@ def wait_for_topic(bootstrap: str, topic: str) -> None:
         time.sleep(TOPIC_RETRY_DELAY)
 
     raise RuntimeError(
-        f"Topic '{topic}' still not available after "
-        f"{TOPIC_RETRY_ATTEMPTS} attempts. Is kafka-init healthy?\n"
-        f"Run:  docker compose logs kafka-init"
+        f"Topic '{topic}' still not available after {TOPIC_RETRY_ATTEMPTS} attempts."
     )
+
+
+# ── Graceful shutdown ─────────────────────────────────────────────────────────
+
+_running = True
+
+
+def _handle_signal(signum, _frame) -> None:
+    global _running
+    log.info("Signal %d received — shutting down …", signum)
+    _running = False
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="US Stocks Kafka Consumer — real-time parallel mode"
+    )
+    p.add_argument("--batch-size",  type=int,   default=MICRO_BATCH_SIZE,
+                   help="Flush batch when this many messages buffered")
+    p.add_argument("--max-wait-ms", type=int,   default=MAX_WAIT_MS,
+                   help="Flush batch after this many ms even if buffer not full")
+    p.add_argument("--timeout",     type=float, default=POLL_TIMEOUT,
+                   help="Kafka poll timeout in seconds")
+    p.add_argument("--group",       type=str,   default=None)
+    p.add_argument("--topic",       type=str,   default=None)
+    p.add_argument("--live",        action="store_true",
+                   help="Print every valid message as it arrives")
+    return p.parse_args()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -320,42 +321,62 @@ def main() -> None:
     topic     = args.topic or os.getenv("KAFKA_TOPIC",    DEFAULT_TOPIC)
     group     = args.group or os.getenv("KAFKA_GROUP_ID", DEFAULT_GROUP)
 
-    log.info("=== US Stocks Kafka Consumer ===")
-    log.info("Broker     : %s", bootstrap)
-    log.info("Topic      : %s", topic)
-    log.info("Group      : %s", group)
-    log.info("Batch size : %d messages", args.batch_size)
+    log.info("=" * 62)
+    log.info("  US Stocks Kafka Consumer  [PARALLEL REAL-TIME MODE]")
+    log.info("=" * 62)
+    log.info("  Broker       : %s", bootstrap)
+    log.info("  Topic        : %s", topic)
+    log.info("  Group        : %s", group)
+    log.info("  Batch size   : %d messages (size trigger)", args.batch_size)
+    log.info("  Max wait     : %d ms       (time trigger)", args.max_wait_ms)
+    log.info("  Live mode    : %s", "ON — printing every message" if args.live else "OFF")
+    log.info("  Design       : flushes on SIZE or TIME — whichever comes first")
+    log.info("=" * 62)
 
     signal.signal(signal.SIGINT,  _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
     wait_for_topic(bootstrap, topic)
-
     consumer = build_consumer(bootstrap, group, topic)
 
     global_stats: dict = {"total": 0, "valid": 0, "invalid": 0, "batches": 0}
-    batch_num    = 0
+    batch_num   = 0
     buffer:  list[Message] = []
+    max_wait_s  = args.max_wait_ms / 1000.0
+    batch_start = time.monotonic()   # clock for the time trigger
+
+    def _flush_buffer(trigger: str) -> None:
+        nonlocal batch_num, buffer, batch_start
+        if not buffer:
+            batch_start = time.monotonic()
+            return
+        batch_num += 1
+        stats = process_micro_batch(buffer, batch_num, trigger, global_stats, args.live)
+        log_batch_summary(stats)
+        consumer.commit(asynchronous=False)
+        buffer     = []
+        batch_start = time.monotonic()
 
     try:
         while _running:
             msg = consumer.poll(timeout=args.timeout)
 
+            # ── Time trigger: flush regardless of buffer fullness ──────────
+            elapsed_since_flush = time.monotonic() - batch_start
+            if elapsed_since_flush >= max_wait_s:
+                _flush_buffer(trigger="time")
+
             if msg is None:
-                if buffer:
-                    batch_num += 1
-                    stats = process_micro_batch(buffer, batch_num, global_stats)
-                    log_batch_summary(stats)
-                    consumer.commit(asynchronous=False)
-                    buffer = []
+                # No new message — time trigger already handled above
                 continue
 
             if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
+                code = msg.error().code()
+                if code == KafkaError._PARTITION_EOF:
                     log.debug("End of partition %d @ offset %d",
                               msg.partition(), msg.offset())
-                elif msg.error().code() == KafkaError.UNKNOWN_TOPIC_OR_PART:
-                    log.warning("Topic not found mid-run — waiting 5s …")
+                elif code == KafkaError.UNKNOWN_TOPIC_OR_PART:
+                    log.warning("Topic not found mid-run — waiting 5 s …")
                     time.sleep(5)
                 else:
                     raise KafkaException(msg.error())
@@ -363,25 +384,17 @@ def main() -> None:
 
             buffer.append(msg)
 
+            # ── Size trigger: flush when buffer is full ───────────────────
             if len(buffer) >= args.batch_size:
-                batch_num += 1
-                stats = process_micro_batch(buffer, batch_num, global_stats)
-                log_batch_summary(stats)
-                consumer.commit(asynchronous=False)
-                buffer = []
+                _flush_buffer(trigger="size")
 
     except KafkaException as exc:
         log.error("Kafka error: %s", exc)
         sys.exit(1)
     finally:
+        # Drain any remaining buffered messages
         if buffer:
-            batch_num += 1
-            stats = process_micro_batch(buffer, batch_num, global_stats)
-            log_batch_summary(stats)
-            try:
-                consumer.commit(asynchronous=False)
-            except Exception:
-                pass
+            _flush_buffer(trigger="shutdown")
 
         consumer.close()
         log_global_summary(global_stats)
