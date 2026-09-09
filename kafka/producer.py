@@ -3,8 +3,12 @@ Kafka Producer — US Stock Dataset (Kaggle)
 ==========================================
 M1 · Data & Kafka  |  Real-Time US Stocks Data Pipeline
 
-Reads CSV files directly from the Kaggle API (no local download),
-serialises each row as a canonical JSON event, and publishes to Kafka.
+Downloads each CSV file INDIVIDUALLY from the Kaggle API so events are
+produced immediately as each file arrives — true real-time streaming
+instead of buffering the full 600 MB ZIP before publishing anything.
+
+Flow:
+    list files → for each CSV: download → parse → produce → next file
 
 Usage:
     python producer.py [--speed FLOAT] [--batch-size INT] [--ticker SYMBOL]
@@ -26,7 +30,7 @@ import os
 import time
 import zipfile
 from datetime import datetime
-from typing import Generator, Iterator, Optional
+from typing import Generator, Optional
 
 import pandas as pd
 import requests
@@ -46,11 +50,11 @@ KAGGLE_DATASET   = "footballjoe789/us-stock-dataset"
 KAGGLE_API_BASE  = "https://www.kaggle.com/api/v1"
 DEFAULT_TOPIC    = "us-stocks-raw"
 DEFAULT_BROKER   = "localhost:9092"
-MICRO_BATCH_SIZE = 50          # rows per simulated "tick"
-SPEED_FACTOR     = 1.0         # 1.0 = real-time cadence; >1 = faster
+MICRO_BATCH_SIZE = 50
+SPEED_FACTOR     = 1.0
 
 
-# ── Kaggle helper ─────────────────────────────────────────────────────────────
+# ── Kaggle auth ───────────────────────────────────────────────────────────────
 
 def _kaggle_auth() -> tuple[str, str]:
     """Return (username, key) from env or ~/.kaggle/kaggle.json."""
@@ -75,65 +79,86 @@ def _kaggle_auth() -> tuple[str, str]:
     return username, key
 
 
-def stream_kaggle_zip(dataset: str = KAGGLE_DATASET) -> zipfile.ZipFile:
+# ── Kaggle: list files ────────────────────────────────────────────────────────
+
+def list_kaggle_csv_files(dataset: str = KAGGLE_DATASET) -> list[str]:
     """
-    Download the dataset zip from Kaggle API into memory and return a ZipFile.
+    Return sorted list of CSV filenames in the dataset using the Kaggle SDK.
+
+    We use the kaggle Python package (already in requirements.txt) to call
+    dataset_list_files() which hits the API without downloading any data.
 
     Args:
-        dataset: Kaggle dataset identifier  owner/dataset-name
+        dataset: 'owner/dataset-name'
 
     Returns:
-        In-memory ZipFile ready for reading.
-
-    Raises:
-        requests.HTTPError: on non-200 responses.
+        Sorted list of member filenames that end in .csv
     """
-    username, key = _kaggle_auth()
-    url = f"{KAGGLE_API_BASE}/datasets/download/{dataset}"
+    from kaggle.api.kaggle_api_extended import KaggleApiExtended
 
-    log.info("Connecting to Kaggle API → %s", url)
-    resp = requests.get(url, auth=(username, key), stream=True, timeout=120)
-    resp.raise_for_status()
+    api = KaggleApiExtended()
+    api.authenticate()
 
-    log.info("Buffering dataset into memory …")
-    buf = io.BytesIO()
-    total = 0
-    for chunk in resp.iter_content(chunk_size=1 << 20):   # 1 MB chunks
-        buf.write(chunk)
-        total += len(chunk)
-        if total % (20 << 20) == 0:
-            log.info("  … %.0f MB received", total / 1e6)
+    log.info("Fetching file list for dataset '%s' …", dataset)
+    response = api.dataset_list_files(dataset)
 
-    buf.seek(0)
-    log.info("Download complete — %.1f MB in memory", total / 1e6)
-    return zipfile.ZipFile(buf)
+    csv_files = sorted(
+        f.name for f in response.files
+        if f.name.lower().endswith(".csv")
+    )
+    log.info("Found %d CSV files in the dataset", len(csv_files))
+    return csv_files
 
 
-def list_csv_files(zf: zipfile.ZipFile) -> list[str]:
-    """Return sorted list of .csv members inside the ZipFile."""
-    return sorted(n for n in zf.namelist() if n.lower().endswith(".csv"))
+# ── Kaggle: download one CSV ──────────────────────────────────────────────────
 
-
-def read_csv_from_zip(zf: zipfile.ZipFile, name: str) -> pd.DataFrame:
+def download_single_csv(
+    filename: str,
+    dataset: str = KAGGLE_DATASET,
+) -> pd.DataFrame:
     """
-    Read a single CSV from an open ZipFile into a DataFrame.
+    Download a SINGLE CSV file from the Kaggle dataset into memory and
+    return a parsed DataFrame.  The response is either raw CSV or a small
+    ZIP containing just that file — both cases are handled.
+
+    This is the core change vs the original producer: instead of buffering
+    the entire 600 MB ZIP, we download one ~50–200 KB CSV at a time and
+    start producing events immediately.
 
     Args:
-        zf:   Open ZipFile object.
-        name: Member filename.
+        filename: The member filename returned by list_kaggle_csv_files().
+        dataset:  'owner/dataset-name'
 
     Returns:
         Parsed DataFrame with normalised column names.
     """
-    with zf.open(name) as f:
-        df = pd.read_csv(f, low_memory=False)
+    username, key = _kaggle_auth()
+    url = f"{KAGGLE_API_BASE}/datasets/download/{dataset}/{filename}"
 
-    # Normalise column names: strip whitespace, lowercase
+    resp = requests.get(url, auth=(username, key), stream=True, timeout=60)
+    resp.raise_for_status()
+
+    buf = io.BytesIO(resp.content)
+
+    # Kaggle sometimes wraps the single file in a small ZIP
+    if zipfile.is_zipfile(buf):
+        buf.seek(0)
+        with zipfile.ZipFile(buf) as zf:
+            csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+            if not csv_names:
+                raise ValueError(f"No CSV found inside zip for {filename}")
+            with zf.open(csv_names[0]) as f:
+                df = pd.read_csv(f, low_memory=False)
+    else:
+        buf.seek(0)
+        df = pd.read_csv(buf, low_memory=False)
+
+    # Normalise column names
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Derive ticker symbol from filename if not in columns
+    # Ensure ticker column exists
     if "ticker" not in df.columns and "symbol" not in df.columns:
-        ticker = os.path.splitext(os.path.basename(name))[0].upper()
+        ticker = os.path.splitext(os.path.basename(filename))[0].upper()
         df.insert(0, "ticker", ticker)
     elif "symbol" in df.columns and "ticker" not in df.columns:
         df = df.rename(columns={"symbol": "ticker"})
@@ -144,29 +169,7 @@ def read_csv_from_zip(zf: zipfile.ZipFile, name: str) -> pd.DataFrame:
 # ── Event schema ──────────────────────────────────────────────────────────────
 
 def row_to_event(row: pd.Series, source_file: str) -> dict:
-    """
-    Convert a DataFrame row to the canonical JSON event schema.
-
-    Canonical fields (all lower-case):
-        event_id    – monotonic counter (added by caller)
-        ticker      – stock symbol
-        date        – trading date  YYYY-MM-DD
-        open        – opening price
-        high        – daily high
-        low         – daily low
-        close       – closing price
-        adj_close   – adjusted close  (if available)
-        volume      – trading volume
-        source_file – originating CSV filename
-        produced_at – ISO-8601 wall-clock timestamp
-
-    Args:
-        row:         Pandas Series (one CSV row).
-        source_file: Name of the originating CSV file.
-
-    Returns:
-        Dict ready for JSON serialisation.
-    """
+    """Convert a DataFrame row to the canonical JSON event schema."""
     def _safe(key: str) -> Optional[float]:
         val = row.get(key)
         if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -176,7 +179,6 @@ def row_to_event(row: pd.Series, source_file: str) -> dict:
         except (TypeError, ValueError):
             return None
 
-    # Resolve date column
     date_val = None
     for col in ("date", "timestamp", "time", "datetime"):
         if col in row.index and row[col] and str(row[col]) != "nan":
@@ -200,33 +202,32 @@ def row_to_event(row: pd.Series, source_file: str) -> dict:
 # ── Micro-batch generator ─────────────────────────────────────────────────────
 
 def micro_batch_events(
-    zf: zipfile.ZipFile,
+    csv_files: list[str],
     batch_size: int = MICRO_BATCH_SIZE,
     ticker_filter: Optional[str] = None,
 ) -> Generator[list[dict], None, None]:
     """
-    Yield micro-batches of canonical events from all CSVs in the zip.
+    For each CSV in the list: download it, parse it, yield micro-batches
+    of events immediately — no waiting for other files to finish.
 
     Args:
-        zf:            Open ZipFile with the dataset.
+        csv_files:     Filenames from list_kaggle_csv_files().
         batch_size:    Rows per yielded batch.
         ticker_filter: If set, only emit rows for this ticker symbol.
 
     Yields:
         List of event dicts (length ≤ batch_size).
     """
-    csv_files = list_csv_files(zf)
-    log.info("Found %d CSV files in the dataset", len(csv_files))
-
     event_id = 0
+
     for fname in csv_files:
         ticker_hint = os.path.splitext(os.path.basename(fname))[0].upper()
         if ticker_filter and ticker_hint != ticker_filter.upper():
             continue
 
-        log.info("Loading %s …", fname)
+        log.info("Downloading %s …", fname)
         try:
-            df = read_csv_from_zip(zf, fname)
+            df = download_single_csv(fname)
         except Exception as exc:
             log.warning("Skipping %s — %s", fname, exc)
             continue
@@ -234,10 +235,12 @@ def micro_batch_events(
         if df.empty:
             continue
 
-        # Sort by date ascending so replay is chronological
+        # Sort chronologically
         date_cols = [c for c in df.columns if c in ("date", "timestamp", "time")]
         if date_cols:
             df = df.sort_values(date_cols[0], ascending=True)
+
+        log.info("  → %d rows | ticker=%s | producing now …", len(df), ticker_hint)
 
         batch: list[dict] = []
         for _, row in df.iterrows():
@@ -253,26 +256,19 @@ def micro_batch_events(
         if batch:
             yield batch
 
+        log.info("  ✓ Done with %s", fname)
+
 
 # ── Kafka producer ────────────────────────────────────────────────────────────
 
 def build_producer(bootstrap_servers: str) -> Producer:
-    """
-    Build and return a confluent-kafka Producer.
-
-    Args:
-        bootstrap_servers: Comma-separated host:port pairs.
-
-    Returns:
-        Configured Producer instance.
-    """
     conf = {
         "bootstrap.servers":            bootstrap_servers,
-        "acks":                         "all",          # strongest guarantee
+        "acks":                         "all",
         "retries":                      5,
         "retry.backoff.ms":             500,
-        "linger.ms":                    10,             # small batching window
-        "batch.size":                   65536,          # 64 KB
+        "linger.ms":                    10,
+        "batch.size":                   65536,
         "compression.type":             "lz4",
         "enable.idempotence":           True,
         "max.in.flight.requests.per.connection": 5,
@@ -281,7 +277,6 @@ def build_producer(bootstrap_servers: str) -> Producer:
 
 
 def delivery_callback(err, msg) -> None:
-    """Confluent-kafka delivery report callback."""
     if err:
         log.error("Delivery FAILED | topic=%s | %s", msg.topic(), err)
     else:
@@ -291,18 +286,14 @@ def delivery_callback(err, msg) -> None:
         )
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="US Stocks Kafka Producer")
-    p.add_argument("--speed",      type=float, default=SPEED_FACTOR,
-                   help="Replay speed multiplier (default 1.0 = real-time)")
-    p.add_argument("--batch-size", type=int,   default=MICRO_BATCH_SIZE,
-                   help="Rows per micro-batch (default 50)")
-    p.add_argument("--ticker",     type=str,   default=None,
-                   help="Only stream a specific ticker symbol, e.g. AAPL")
-    p.add_argument("--topic",      type=str,   default=None,
-                   help="Override Kafka topic name")
+    p = argparse.ArgumentParser(description="US Stocks Kafka Producer (streaming per-file)")
+    p.add_argument("--speed",      type=float, default=SPEED_FACTOR)
+    p.add_argument("--batch-size", type=int,   default=MICRO_BATCH_SIZE)
+    p.add_argument("--ticker",     type=str,   default=None)
+    p.add_argument("--topic",      type=str,   default=None)
     return p.parse_args()
 
 
@@ -313,22 +304,24 @@ def main() -> None:
     bootstrap = os.getenv("KAFKA_BOOTSTRAP", DEFAULT_BROKER)
     topic     = args.topic or os.getenv("KAFKA_TOPIC", DEFAULT_TOPIC)
 
-    log.info("=== US Stocks Kafka Producer ===")
+    log.info("=== US Stocks Kafka Producer (real-time per-file mode) ===")
     log.info("Broker : %s", bootstrap)
     log.info("Topic  : %s", topic)
     log.info("Speed  : %.1fx  |  Batch size: %d rows", args.speed, args.batch_size)
+    log.info("Mode   : download one CSV → produce immediately → next CSV")
 
     producer = build_producer(bootstrap)
 
-    # Stream dataset directly from Kaggle
-    zf = stream_kaggle_zip()
+    # Step 1: get file list (fast — no data downloaded yet)
+    csv_files = list_kaggle_csv_files()
 
     total_events   = 0
     total_batches  = 0
-    delay_per_batch = (args.batch_size / 252 / 6.5 / 3600) / args.speed  # simulated seconds
+    delay_per_batch = (args.batch_size / 252 / 6.5 / 3600) / args.speed
 
     try:
-        for batch in micro_batch_events(zf, args.batch_size, args.ticker):
+        # Step 2: for each file: download → parse → produce → next
+        for batch in micro_batch_events(csv_files, args.batch_size, args.ticker):
             for event in batch:
                 key   = event["ticker"].encode()
                 value = json.dumps(event, default=str).encode()
@@ -339,7 +332,7 @@ def main() -> None:
                     callback=delivery_callback,
                 )
 
-            producer.poll(0)            # trigger delivery callbacks
+            producer.poll(0)
 
             total_events  += len(batch)
             total_batches += 1
@@ -350,7 +343,6 @@ def main() -> None:
                     total_batches, total_events,
                 )
 
-            # Simulate time passing between micro-batches
             if delay_per_batch > 0:
                 time.sleep(delay_per_batch)
 

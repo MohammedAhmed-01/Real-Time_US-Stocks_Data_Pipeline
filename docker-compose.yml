@@ -129,6 +129,9 @@ services:
       start_period: 30s
 
   # ── Topic initialiser (runs once, then exits) ──────────────────────────────
+  # FIX: every kafka-topics call is on ONE line — backslash continuations
+  #      inside a YAML block scalar are eaten by the YAML parser before bash
+  #      sees them, which caused "Command must include exactly one action".
   kafka-init:
     image: confluentinc/cp-kafka:7.6.1
     container_name: kafka-init
@@ -142,41 +145,31 @@ services:
       kafka-3:
         condition: service_healthy
     entrypoint: ["/bin/bash", "-c"]
-    command: |
-      "
-      echo '──────────────────────────────────────────────────'
-      echo '  Creating Kafka topics (KRaft cluster) …'
-      echo '──────────────────────────────────────────────────'
+    command:
+      - |
+        set -e
+        echo '--------------------------------------------------'
+        echo '  Waiting 30 s for KRaft leader election ...'
+        echo '--------------------------------------------------'
+        sleep 30
 
-      kafka-topics --bootstrap-server kafka-1:29092 \
-        --create --if-not-exists \
-        --topic us-stocks-raw \
-        --partitions 6 \
-        --replication-factor 3 \
-        --config retention.ms=604800000 \
-        --config compression.type=lz4 \
-        --config min.insync.replicas=2
+        echo '  Creating topic: us-stocks-raw'
+        kafka-topics --bootstrap-server kafka-1:29092 --create --if-not-exists --topic us-stocks-raw --partitions 6 --replication-factor 3 --config retention.ms=604800000 --config compression.type=lz4 --config min.insync.replicas=2
 
-      kafka-topics --bootstrap-server kafka-1:29092 \
-        --create --if-not-exists \
-        --topic us-stocks-dead-letter \
-        --partitions 3 \
-        --replication-factor 3 \
-        --config retention.ms=2592000000 \
-        --config compression.type=lz4
+        echo '  Creating topic: us-stocks-dead-letter'
+        kafka-topics --bootstrap-server kafka-1:29092 --create --if-not-exists --topic us-stocks-dead-letter --partitions 3 --replication-factor 3 --config retention.ms=2592000000 --config compression.type=lz4
 
-      echo ''
-      echo 'All topics:'
-      kafka-topics --bootstrap-server kafka-1:29092 --list
+        echo ''
+        echo '  All topics:'
+        kafka-topics --bootstrap-server kafka-1:29092 --list
 
-      echo ''
-      echo 'Details — us-stocks-raw:'
-      kafka-topics --bootstrap-server kafka-1:29092 --describe --topic us-stocks-raw
+        echo ''
+        echo '  Details - us-stocks-raw:'
+        kafka-topics --bootstrap-server kafka-1:29092 --describe --topic us-stocks-raw
 
-      echo '──────────────────────────────────────────────────'
-      echo '  Topics ready. Done.'
-      echo '──────────────────────────────────────────────────'
-      "
+        echo '--------------------------------------------------'
+        echo '  Topics ready. Done.'
+        echo '--------------------------------------------------'
     restart: "no"
 
   # ── Producer (streams Kaggle → Kafka) ─────────────────────────────────────
@@ -196,7 +189,7 @@ services:
       kafka-3:
         condition: service_healthy
       kafka-init:
-        condition: service_completed_successfully  # topics must exist first
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP:   kafka-1:29092,kafka-2:29093,kafka-3:29094
       KAFKA_TOPIC:       us-stocks-raw
@@ -212,7 +205,7 @@ services:
       context: .
       dockerfile: Dockerfile.python
     container_name: stocks-consumer
-    restart: "no"
+    restart: on-failure
     networks:
       - stocks-net
     depends_on:
@@ -223,7 +216,7 @@ services:
       kafka-3:
         condition: service_healthy
       kafka-init:
-        condition: service_completed_successfully  # topics must exist first
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP:   kafka-1:29092,kafka-2:29093,kafka-3:29094
       KAFKA_TOPIC:       us-stocks-raw
