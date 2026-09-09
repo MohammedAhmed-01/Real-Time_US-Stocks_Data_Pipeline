@@ -3,22 +3,22 @@ producer.py — US Stock Dataset Kafka Producer (Steady Real-Time Mode)
 =====================================================================
 M1 · Data & Kafka  |  Real-Time US Stocks Data Pipeline
 
+File discovery:
+    Instead of querying the Kaggle API for a file list (which is paginated
+    and unreliable for large datasets), the producer reads ticker symbols
+    directly from a local CSV file (Stock_List.csv) and constructs the
+    Kaggle file paths from those symbols.  This guarantees all 6 000+
+    tickers are covered without any API pagination issues.
+
+    Default lookup path : /app/Stock_List.csv  (inside Docker)
+    Override with       : --stock-list <path>
+
 Architecture:
     Download Thread  →  queue(fname, df)  →  Main Thread (producer)
-    Downloads CSV files from Kaggle and enqueues them; the main thread
-    converts rows to JSON events and publishes them to Kafka at a
-    controlled pace (--rows-per-sec, default 1 row/s).
-
-    The producer NEVER stops until every file in the dataset has been
-    fully produced to Kafka.
-
-    NOTE: per-file downloads are paced with a small fixed delay
-    (MIN_DELAY_BETWEEN_CALLS) and explicit HTTP 429 / "too many requests"
-    detection with a longer backoff, to avoid tripping Kaggle's API rate
-    limiter when streaming many files back-to-back.
 
 Usage:
-    python producer.py [--rows-per-sec FLOAT] [--batch-size INT] [--ticker SYMBOL]
+    python producer.py [--rows-per-sec FLOAT] [--batch-size INT]
+                       [--ticker SYMBOL] [--stock-list PATH]
 
 Environment variables (or .env):
     KAGGLE_USERNAME   Kaggle account username
@@ -66,21 +66,23 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-KAGGLE_DATASET      = "footballjoe789/us-stock-dataset"
-KAGGLE_API_BASE     = "https://www.kaggle.com/api/v1"
-DEFAULT_TOPIC       = "us-stocks-raw"
-DEFAULT_BROKER      = "localhost:9092"
-DEFAULT_ROWS_PER_SEC = 1.0       # 1 row per second by default (steady pace)
-DEFAULT_BATCH_SIZE  = 50         # rows per Kafka produce call
-QUEUE_MAXSIZE       = 5          # max files buffered between download and produce
+KAGGLE_DATASET       = "footballjoe789/us-stock-dataset"
+KAGGLE_API_BASE      = "https://www.kaggle.com/api/v1"
+DEFAULT_TOPIC        = "us-stocks-raw"
+DEFAULT_BROKER       = "localhost:9092"
+DEFAULT_ROWS_PER_SEC = 1.0
+DEFAULT_BATCH_SIZE   = 50
+QUEUE_MAXSIZE        = 5
 
-STOCK_PATH_PREFIX   = "data/stockhistory"
-REQUIRED_STOCK_COLS = {"date", "open", "high", "low", "close", "volume"}
+STOCK_PATH_PREFIX    = "data/stockhistory"
+REQUIRED_STOCK_COLS  = {"date", "open", "high", "low", "close", "volume"}
 
-# NEW: pacing between successive Kaggle API calls to avoid rate-limiting
-MIN_DELAY_BETWEEN_CALLS = 2.0     # seconds — sleep after every successful download
-RATE_LIMIT_BASE_WAIT    = 15      # seconds — base backoff step when 429 is hit
-RATE_LIMIT_MAX_WAIT     = 120     # seconds — cap for the 429 backoff
+# Default location of the ticker list inside Docker (volume-mounted at /app)
+DEFAULT_STOCK_LIST   = "/app/Stock_List.csv"
+
+MIN_DELAY_BETWEEN_CALLS = 2.0
+RATE_LIMIT_BASE_WAIT    = 15
+RATE_LIMIT_MAX_WAIT     = 120
 
 _SENTINEL = object()
 
@@ -154,70 +156,35 @@ def _kaggle_env() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Kaggle: list CSV files
+# Build file list from Stock_List.csv  (primary — always complete)
 # ---------------------------------------------------------------------------
 
-def list_kaggle_csv_files(dataset: str = KAGGLE_DATASET) -> list[str]:
-    log.info("Fetching file list for dataset '%s' …", dataset)
-    try:
-        result = subprocess.run(
-            ["kaggle", "datasets", "files", dataset, "--csv"],
-            capture_output=True, text=True,
-            env=_kaggle_env(), timeout=60,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip())
+def build_file_list_from_csv(stock_list_path: str) -> list[str]:
+    """Read ticker symbols from Stock_List.csv and return Kaggle file paths.
 
-        lines = result.stdout.strip().splitlines()
-        csv_files = sorted(
-            line.split(",")[0].strip()
-            for line in lines[1:]
-            if line.split(",")[0].strip().lower().endswith(".csv")
-        )
-        log.info("Found %d CSV files in the dataset.", len(csv_files))
-        return csv_files
+    The CSV has a single column called 'Symbol' (header on row 1).
+    Each ticker maps to:  data/stockhistory/<TICKER>.csv
+    """
+    log.info("Reading ticker list from '%s' …", stock_list_path)
+    df = pd.read_csv(stock_list_path, dtype=str)
 
-    except (FileNotFoundError, RuntimeError) as exc:
-        log.warning("kaggle CLI failed (%s) — falling back to REST API …", exc)
-        return _list_csv_files_rest(dataset)
+    # Accept 'Symbol', 'symbol', 'Ticker', 'ticker', or bare first column
+    col = None
+    for candidate in ("Symbol", "symbol", "Ticker", "ticker"):
+        if candidate in df.columns:
+            col = candidate
+            break
+    if col is None:
+        col = df.columns[0]
 
-
-def _list_csv_files_rest(dataset: str) -> list[str]:
-    username, key = _kaggle_auth()
-    owner, slug   = dataset.split("/", 1)
-    endpoints = [
-        f"{KAGGLE_API_BASE}/datasets/{owner}/{slug}/files?page=1&pageSize=500",
-        f"{KAGGLE_API_BASE}/datasets/{owner}/{slug}?fields=files",
-    ]
-    for url in endpoints:
-        try:
-            resp = requests.get(url, auth=(username, key), timeout=30)
-            if resp.status_code == 404:
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            raw  = data if isinstance(data, list) else (
-                data.get("datasetFiles") or data.get("files") or []
-            )
-            csv_files = sorted(
-                f.get("name", "")
-                for f in raw
-                if f.get("name", "").lower().endswith(".csv")
-            )
-            if csv_files:
-                log.info("Found %d CSV files via REST fallback.", len(csv_files))
-                return csv_files
-        except Exception as exc:
-            log.warning("REST endpoint %s failed: %s", url, exc)
-
-    raise RuntimeError(
-        f"Could not list files for dataset '{dataset}'. "
-        "Check KAGGLE_USERNAME / KAGGLE_KEY and the dataset slug."
-    )
+    tickers = sorted(df[col].dropna().str.strip().str.upper().unique())
+    paths   = [f"{STOCK_PATH_PREFIX}/{t}.csv" for t in tickers]
+    log.info("Built file list: %d tickers from Stock_List.csv", len(paths))
+    return paths
 
 
 # ---------------------------------------------------------------------------
-# Kaggle: download one CSV file  (with unlimited retries)
+# Kaggle: download one CSV file  (with retries + rate-limit backoff)
 # ---------------------------------------------------------------------------
 
 def _normalise_df(df: pd.DataFrame, filename: str) -> pd.DataFrame:
@@ -235,7 +202,6 @@ def _is_stock_file(df: pd.DataFrame) -> bool:
 
 
 def _is_rate_limit_stderr(stderr: str) -> bool:
-    """Detect a Kaggle CLI rate-limit response from its stderr text."""
     if not stderr:
         return False
     lowered = stderr.lower()
@@ -248,13 +214,6 @@ def download_single_csv(
     max_retries: int = 10,
     min_delay_between_calls: float = MIN_DELAY_BETWEEN_CALLS,
 ) -> pd.DataFrame:
-    """Download one CSV — retries forever (up to max_retries) on any error.
-
-    Paces itself with a fixed delay after every successful call, and reacts
-    to HTTP 429 / "too many requests" with a dedicated, longer backoff so
-    that streaming many small files back-to-back doesn't trip Kaggle's
-    rate limiter.
-    """
     for attempt in range(1, max_retries + 1):
         # --- CLI path ---
         try:
@@ -281,8 +240,7 @@ def download_single_csv(
                 if _is_rate_limit_stderr(result.stderr):
                     wait = min(RATE_LIMIT_MAX_WAIT, RATE_LIMIT_BASE_WAIT * attempt)
                     log.warning(
-                        "[DL] Rate-limited by Kaggle CLI for %s (attempt %d/%d) — "
-                        "waiting %ds …",
+                        "[DL] Rate-limited (CLI) for %s attempt %d/%d — waiting %ds …",
                         filename, attempt, max_retries, wait,
                     )
                     time.sleep(wait)
@@ -300,8 +258,7 @@ def download_single_csv(
             if resp.status_code == 429:
                 wait = min(RATE_LIMIT_MAX_WAIT, RATE_LIMIT_BASE_WAIT * attempt)
                 log.warning(
-                    "[DL] Rate-limited by Kaggle REST for %s (attempt %d/%d) — "
-                    "waiting %ds …",
+                    "[DL] Rate-limited (REST) for %s attempt %d/%d — waiting %ds …",
                     filename, attempt, max_retries, wait,
                 )
                 time.sleep(wait)
@@ -335,7 +292,7 @@ def download_single_csv(
 
 
 # ---------------------------------------------------------------------------
-# Background download thread — NEVER skips a file, retries on failure
+# Background download thread
 # ---------------------------------------------------------------------------
 
 def _download_worker(
@@ -344,16 +301,9 @@ def _download_worker(
     file_queue: queue.Queue,
     stats: _Stats,
 ) -> None:
-    """Download every stock CSV and push it onto the queue. Never exits early."""
     for fname in csv_files:
-        normalised = fname.lower().replace("\\", "/")
-
-        if not normalised.startswith(STOCK_PATH_PREFIX):
-            log.debug("Skipping non-StockHistory file: %s", fname)
-            stats.file_skipped()
-            continue
-
         ticker_hint = os.path.splitext(os.path.basename(fname))[0].upper()
+
         if ticker_filter and ticker_hint != ticker_filter.upper():
             stats.file_skipped()
             continue
@@ -377,10 +327,9 @@ def _download_worker(
                 df = df.sort_values(date_cols[0], ascending=True)
 
             log.info("[DL] Ready  file=%-30s  rows=%d", os.path.basename(fname), len(df))
-            file_queue.put((fname, df))   # blocks if queue is full — applies back-pressure
+            file_queue.put((fname, df))
 
         except Exception as exc:
-            # Last-resort skip only after all retries exhausted
             log.error("[DL] Permanently skipping %s after all retries: %s", fname, exc)
             stats.file_skipped()
 
@@ -454,10 +403,6 @@ def delivery_callback(err, msg) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# Produce one batch to Kafka
-# ---------------------------------------------------------------------------
-
 def _produce_batch(producer: Producer, topic: str, batch: list[dict]) -> None:
     for event in batch:
         producer.produce(
@@ -479,8 +424,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rows-per-sec", type=float, default=DEFAULT_ROWS_PER_SEC,
-        help="Rows to produce per second (default: 1.0). "
-             "Use e.g. 10 for faster, 0.5 for slower.",
+        help="Rows to produce per second (default: 1.0)",
     )
     parser.add_argument(
         "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
@@ -493,6 +437,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--topic", type=str, default=None,
         help="Override the target Kafka topic",
+    )
+    parser.add_argument(
+        "--stock-list", type=str, default=DEFAULT_STOCK_LIST,
+        help=f"Path to Stock_List.csv (default: {DEFAULT_STOCK_LIST})",
     )
     return parser.parse_args()
 
@@ -508,9 +456,8 @@ def main() -> None:
     bootstrap = os.getenv("KAFKA_BOOTSTRAP", DEFAULT_BROKER)
     topic     = args.topic or os.getenv("KAFKA_TOPIC", DEFAULT_TOPIC)
 
-    # How long to sleep between individual rows to hit the target rate
-    rows_per_sec   = max(args.rows_per_sec, 0.01)
-    sleep_per_row  = 1.0 / rows_per_sec   # seconds between rows
+    rows_per_sec  = max(args.rows_per_sec, 0.01)
+    sleep_per_row = 1.0 / rows_per_sec
 
     log.info("=" * 62)
     log.info("  US Stocks Kafka Producer  [STEADY REAL-TIME MODE]")
@@ -518,21 +465,22 @@ def main() -> None:
     log.info("  Topic        : %s", topic)
     log.info("  Rows/sec     : %.2f  (%.3f s between rows)", rows_per_sec, sleep_per_row)
     log.info("  Batch size   : %d rows", args.batch_size)
-    log.info("  DL pacing    : %.1fs between files, 429 backoff up to %ds",
-              MIN_DELAY_BETWEEN_CALLS, RATE_LIMIT_MAX_WAIT)
+    log.info("  Stock list   : %s", args.stock_list)
     log.info("=" * 62)
 
-    csv_files   = list_kaggle_csv_files()
-    stock_files = [
-        f for f in csv_files
-        if f.lower().replace("\\", "/").startswith(STOCK_PATH_PREFIX)
-    ]
-    log.info(
-        "Stock files to stream: %d  (skipping %d non-stock files)",
-        len(stock_files), len(csv_files) - len(stock_files),
-    )
+    # ── Build complete file list from Stock_List.csv ─────────────────────────
+    if not os.path.exists(args.stock_list):
+        log.error(
+            "Stock list not found at '%s'. "
+            "Mount Stock_List.csv into the container or use --stock-list <path>.",
+            args.stock_list,
+        )
+        sys.exit(1)
 
-    stats      = _Stats(total_files=len(stock_files))
+    csv_files = build_file_list_from_csv(args.stock_list)
+    log.info("Stock files to stream: %d", len(csv_files))
+
+    stats      = _Stats(total_files=len(csv_files))
     file_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
 
     dl_thread = threading.Thread(
@@ -547,8 +495,6 @@ def main() -> None:
     total_events = 0
     event_id     = 0
     start_wall   = time.time()
-
-    # Timing state for pacing
     next_row_time = time.monotonic()
 
     try:
@@ -569,14 +515,13 @@ def main() -> None:
             log.info(
                 "START  file=%-14s  rows=%d  files=%d/%d done  total=%d",
                 basename, file_rows,
-                stats.done_files, len(stock_files),
+                stats.done_files, len(csv_files),
                 total_events,
             )
 
             batch: list[dict] = []
 
             for _, row in df.iterrows():
-                # ── Pace control: sleep until it is time for the next row ──
                 now = time.monotonic()
                 if next_row_time > now:
                     time.sleep(next_row_time - now)
@@ -603,7 +548,6 @@ def main() -> None:
                     )
                     batch = []
 
-            # Flush partial tail batch
             if batch:
                 _produce_batch(producer, topic, batch)
                 total_events += len(batch)
@@ -616,7 +560,7 @@ def main() -> None:
                 "DONE   file=%-14s  events=%d  time=%.1fs  "
                 "files=%d/%d  grand_total=%d",
                 basename, file_events, file_elapsed,
-                stats.done_files, len(stock_files),
+                stats.done_files, len(csv_files),
                 total_events,
             )
 
@@ -631,10 +575,9 @@ def main() -> None:
         log.info("=" * 62)
         log.info("  PRODUCER FINISHED")
         log.info("  Total events  : %d", total_events)
-        log.info("  Files done    : %d / %d", stats.done_files, len(stock_files))
+        log.info("  Files done    : %d / %d", stats.done_files, len(csv_files))
         log.info("  Files skipped : %d", stats.skipped_files)
-        log.info("  Wall time     : %.1f s  (%s)",
-                 elapsed, stats.elapsed_str())
+        log.info("  Wall time     : %.1f s  (%s)", elapsed, stats.elapsed_str())
         log.info("  Topic         : %s", topic)
         log.info("=" * 62)
 
