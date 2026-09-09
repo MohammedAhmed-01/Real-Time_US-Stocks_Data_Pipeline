@@ -175,7 +175,10 @@ services:
       context: .
       dockerfile: Dockerfile.python
     container_name: stocks-producer
-    restart: "no"                        # never auto-restart — it runs to completion
+    restart: on-failure                  # CHANGED from "no" — auto-restart on crash
+                                          # (e.g. an unexpected exception during a
+                                          # Kaggle rate-limit event). It still won't
+                                          # restart on a clean exit code 0.
     networks:
       - stocks-net
     depends_on:

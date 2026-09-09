@@ -12,6 +12,11 @@ Architecture:
     The producer NEVER stops until every file in the dataset has been
     fully produced to Kafka.
 
+    NOTE: per-file downloads are paced with a small fixed delay
+    (MIN_DELAY_BETWEEN_CALLS) and explicit HTTP 429 / "too many requests"
+    detection with a longer backoff, to avoid tripping Kaggle's API rate
+    limiter when streaming many files back-to-back.
+
 Usage:
     python producer.py [--rows-per-sec FLOAT] [--batch-size INT] [--ticker SYMBOL]
 
@@ -71,6 +76,11 @@ QUEUE_MAXSIZE       = 5          # max files buffered between download and produ
 
 STOCK_PATH_PREFIX   = "data/stockhistory"
 REQUIRED_STOCK_COLS = {"date", "open", "high", "low", "close", "volume"}
+
+# NEW: pacing between successive Kaggle API calls to avoid rate-limiting
+MIN_DELAY_BETWEEN_CALLS = 2.0     # seconds — sleep after every successful download
+RATE_LIMIT_BASE_WAIT    = 15      # seconds — base backoff step when 429 is hit
+RATE_LIMIT_MAX_WAIT     = 120     # seconds — cap for the 429 backoff
 
 _SENTINEL = object()
 
@@ -224,12 +234,27 @@ def _is_stock_file(df: pd.DataFrame) -> bool:
     return REQUIRED_STOCK_COLS.issubset(set(df.columns))
 
 
+def _is_rate_limit_stderr(stderr: str) -> bool:
+    """Detect a Kaggle CLI rate-limit response from its stderr text."""
+    if not stderr:
+        return False
+    lowered = stderr.lower()
+    return "429" in lowered or "too many requests" in lowered
+
+
 def download_single_csv(
     filename: str,
     dataset: str = KAGGLE_DATASET,
     max_retries: int = 10,
+    min_delay_between_calls: float = MIN_DELAY_BETWEEN_CALLS,
 ) -> pd.DataFrame:
-    """Download one CSV — retries forever (up to max_retries) on any error."""
+    """Download one CSV — retries forever (up to max_retries) on any error.
+
+    Paces itself with a fixed delay after every successful call, and reacts
+    to HTTP 429 / "too many requests" with a dedicated, longer backoff so
+    that streaming many small files back-to-back doesn't trip Kaggle's
+    rate limiter.
+    """
     for attempt in range(1, max_retries + 1):
         # --- CLI path ---
         try:
@@ -250,7 +275,18 @@ def download_single_csv(
                                 df = pd.read_csv(
                                     os.path.join(root, fname), low_memory=False
                                 )
+                                time.sleep(min_delay_between_calls)
                                 return _normalise_df(df, filename)
+
+                if _is_rate_limit_stderr(result.stderr):
+                    wait = min(RATE_LIMIT_MAX_WAIT, RATE_LIMIT_BASE_WAIT * attempt)
+                    log.warning(
+                        "[DL] Rate-limited by Kaggle CLI for %s (attempt %d/%d) — "
+                        "waiting %ds …",
+                        filename, attempt, max_retries, wait,
+                    )
+                    time.sleep(wait)
+                    continue
         except Exception as cli_err:
             log.warning("[DL] CLI attempt %d/%d failed for %s: %s",
                         attempt, max_retries, filename, cli_err)
@@ -260,6 +296,17 @@ def download_single_csv(
             username, key = _kaggle_auth()
             url  = f"{KAGGLE_API_BASE}/datasets/download/{dataset}/{filename}"
             resp = requests.get(url, auth=(username, key), stream=True, timeout=300)
+
+            if resp.status_code == 429:
+                wait = min(RATE_LIMIT_MAX_WAIT, RATE_LIMIT_BASE_WAIT * attempt)
+                log.warning(
+                    "[DL] Rate-limited by Kaggle REST for %s (attempt %d/%d) — "
+                    "waiting %ds …",
+                    filename, attempt, max_retries, wait,
+                )
+                time.sleep(wait)
+                continue
+
             resp.raise_for_status()
             buf = io.BytesIO(resp.content)
             if zipfile.is_zipfile(buf):
@@ -269,10 +316,12 @@ def download_single_csv(
                     if csv_names:
                         with zf.open(csv_names[0]) as fh:
                             df = pd.read_csv(fh, low_memory=False)
+                            time.sleep(min_delay_between_calls)
                             return _normalise_df(df, filename)
             else:
                 buf.seek(0)
                 df = pd.read_csv(buf, low_memory=False)
+                time.sleep(min_delay_between_calls)
                 return _normalise_df(df, filename)
         except Exception as rest_err:
             log.warning("[DL] REST attempt %d/%d failed for %s: %s",
@@ -469,6 +518,8 @@ def main() -> None:
     log.info("  Topic        : %s", topic)
     log.info("  Rows/sec     : %.2f  (%.3f s between rows)", rows_per_sec, sleep_per_row)
     log.info("  Batch size   : %d rows", args.batch_size)
+    log.info("  DL pacing    : %.1fs between files, 429 backoff up to %ds",
+              MIN_DELAY_BETWEEN_CALLS, RATE_LIMIT_MAX_WAIT)
     log.info("=" * 62)
 
     csv_files   = list_kaggle_csv_files()
