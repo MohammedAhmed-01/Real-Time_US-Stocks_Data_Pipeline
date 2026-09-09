@@ -2,13 +2,21 @@
 topic_config.py — Kafka topic definitions for the US Stocks pipeline
 =====================================================================
 Single source-of-truth for topic names, partition counts, replication
-factors, and configs.  Import this in both the producer and consumer,
-and reference it from Airflow DAGs and Spark jobs.
+factors, retention configs, and the canonical JSON event schema.
 
-This module can also be run directly to print the handover summary
-that M1 passes to M2:
+The schema reflects the ACTUAL columns in the Kaggle dataset
+  footballjoe789/us-stock-dataset → Data/StockHistory/<TICKER>.csv
 
-    python config/topic_config.py
+Real CSV columns (original casing):
+    Date, Open, High, Low, Close, Volume,
+    Dividends, Stock Splits,
+    STOCHk_14_3_3, STOCHd_14_3_3
+
+Ticker is NOT a CSV column — it is derived from the filename.
+
+Run this module directly to print the M1 → M2 handover summary:
+
+    python topic_config.py
 """
 
 from __future__ import annotations
@@ -69,19 +77,41 @@ KAFKA_BOOTSTRAP_EXTERNAL = "localhost:9092,localhost:9093,localhost:9094"
 CONSUMER_GROUP_M1_VALIDATION = "m1-validation-group"
 CONSUMER_GROUP_M2_SPARK      = "spark-streaming-group"
 
-# Canonical JSON event schema (for M2 Spark schema enforcement)
+# ── Canonical JSON event schema ───────────────────────────────────────────────
+#
+# This is the exact shape of every message on us-stocks-raw.
+# Spark (M2) should use this to define its StructType / DataFrame schema.
+#
+# Nullability notes:
+#   • dividends    — 0.0 on days with no dividend;  never null
+#   • stock_splits — 0.0 on days with no split;     never null
+#   • stochk_14_3_3 / stochd_14_3_3 — null for the first ~14 rows of each
+#     ticker (indicator warm-up period), non-null thereafter
+#
 CANONICAL_SCHEMA: dict[str, str] = {
-    "event_id":    "LongType",
-    "ticker":      "StringType",
-    "date":        "DateType",          # YYYY-MM-DD
-    "open":        "DoubleType",
-    "high":        "DoubleType",
-    "low":         "DoubleType",
-    "close":       "DoubleType",
-    "adj_close":   "DoubleType",        # nullable
-    "volume":      "DoubleType",
-    "source_file": "StringType",
-    "produced_at": "TimestampType",     # ISO-8601 UTC
+    # Identity
+    "event_id":        "LongType",
+    "ticker":          "StringType",       # e.g. "AAPL" — from filename
+    "date":            "DateType",         # YYYY-MM-DD
+
+    # Core OHLCV — always non-null, always > 0 (volume >= 0)
+    "open":            "DoubleType",
+    "high":            "DoubleType",
+    "low":             "DoubleType",
+    "close":           "DoubleType",
+    "volume":          "DoubleType",
+
+    # Corporate actions — non-null, 0.0 on non-event days
+    "dividends":       "DoubleType",
+    "stock_splits":    "DoubleType",
+
+    # Technical indicators — nullable during warm-up
+    "stochk_14_3_3":   "DoubleType (nullable)",
+    "stochd_14_3_3":   "DoubleType (nullable)",
+
+    # Pipeline metadata
+    "source_file":     "StringType",       # e.g. "Data/StockHistory/AAPL.csv"
+    "produced_at":     "TimestampType",    # ISO-8601 UTC, e.g. "2026-09-09T08:38:51Z"
 }
 
 # ── CLI summary ───────────────────────────────────────────────────────────────
@@ -109,10 +139,28 @@ if __name__ == "__main__":
     print(f"    M2 Spark      : {CONSUMER_GROUP_M2_SPARK}")
     print()
 
-    print("  Canonical JSON schema")
+    print("  Canonical JSON event schema")
+    print(f"  {'Field':<20} {'Type':<30} Notes")
+    print("  " + "-" * 58)
+    notes = {
+        "event_id":       "monotonically increasing",
+        "ticker":         "derived from CSV filename",
+        "date":           "trading date",
+        "open":           "must be > 0",
+        "high":           "must be > 0, >= low",
+        "low":            "must be > 0",
+        "close":          "must be > 0",
+        "volume":         "must be >= 0",
+        "dividends":      "0.0 on non-dividend days",
+        "stock_splits":   "0.0 on non-split days",
+        "stochk_14_3_3":  "null during warm-up (~14 rows)",
+        "stochd_14_3_3":  "null during warm-up (~14 rows)",
+        "source_file":    "Kaggle path of originating CSV",
+        "produced_at":    "UTC wall-clock at produce time",
+    }
     for col, dtype in CANONICAL_SCHEMA.items():
-        nullable = " (nullable)" if col == "adj_close" else ""
-        print(f"    {col:<14} {dtype}{nullable}")
+        note = notes.get(col, "")
+        print(f"  {col:<20} {dtype:<30} {note}")
 
     print("=" * 62)
     print()

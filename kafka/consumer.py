@@ -3,27 +3,13 @@ Kafka Consumer — US Stock Dataset  [PARALLEL REAL-TIME MODE]
 ============================================================
 M1 · Data & Kafka  |  Real-Time US Stocks Data Pipeline
 
-This consumer is designed to run IN PARALLEL with the producer.
-It processes messages the moment they arrive — it does NOT wait
-for the producer to finish.
-
 Micro-batch flushing is DUAL-TRIGGERED:
   • Size trigger  — flush when buffer reaches --batch-size messages
-  • Time trigger  — flush every --max-wait-ms milliseconds even if
-                    the buffer is not full (keeps latency low during
-                    periods of slow ingest)
-
-This dual strategy gives you true near-real-time processing:
-  producer writes row 1 → Kafka → consumer sees it in < max-wait-ms
-
-Architecture:
-  Kafka topic ─▶ poll() ─▶ buffer ─▶ [size OR time trigger] ─▶ validate ─▶ stats
+  • Time trigger  — flush every --max-wait-ms milliseconds
 
 Usage:
     python consumer.py [--batch-size INT] [--max-wait-ms INT]
                        [--timeout FLOAT] [--group GROUP] [--live]
-
-    --live        print every individual message to stdout (verbose)
 
 Environment variables (or .env file):
     KAFKA_BOOTSTRAP  – Kafka broker(s), default localhost:9092
@@ -56,23 +42,108 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-DEFAULT_TOPIC       = "us-stocks-raw"
-DEFAULT_BROKER      = "localhost:9092"
-DEFAULT_GROUP       = "m1-validation-group"
-MICRO_BATCH_SIZE    = 100       # flush batch when this many messages buffered
-MAX_WAIT_MS         = 2000      # flush batch after this many ms even if not full
-POLL_TIMEOUT        = 0.5       # seconds per poll() call (kept short for liveness)
+DEFAULT_TOPIC        = "us-stocks-raw"
+DEFAULT_BROKER       = "localhost:9092"
+DEFAULT_GROUP        = "m1-validation-group"
+MICRO_BATCH_SIZE     = 100
+MAX_WAIT_MS          = 2000
+POLL_TIMEOUT         = 0.5
 
 TOPIC_RETRY_ATTEMPTS = 60
 TOPIC_RETRY_DELAY    = 5
 
+# Fields that MUST be present in every event (null values are caught separately).
+# Matches the exact keys produced by producer.row_to_event().
 REQUIRED_FIELDS: frozenset[str] = frozenset({
-    "ticker", "date", "open", "high", "low", "close", "volume",
-    "produced_at", "event_id",
+    "event_id", "ticker", "date",
+    "open", "high", "low", "close", "volume",
+    "dividends", "stock_splits",
+    "stochk_14_3_3", "stochd_14_3_3",
+    "source_file", "produced_at",
 })
+
+# Fields whose value must be a valid float (NaN/None → validation error for core OHLCV).
+# dividends and stock_splits are allowed to be 0.0 on non-event days → not null-checked.
+# stochk/stochd can be null for the first few rows before the indicator warms up → nullable.
 NUMERIC_FIELDS: frozenset[str] = frozenset({
     "open", "high", "low", "close", "volume",
 })
+
+# Nullable numeric fields — present in schema but allowed to be None/null.
+NULLABLE_NUMERIC_FIELDS: frozenset[str] = frozenset({
+    "dividends", "stock_splits", "stochk_14_3_3", "stochd_14_3_3",
+})
+
+
+# ── Live Dashboard ────────────────────────────────────────────────────────────
+
+class ConsumerDashboard:
+    """
+    Rewrites a fixed block of terminal lines so the screen doesn't scroll.
+    Shows consumed/valid/invalid counts, throughput, and last-seen ticker.
+    """
+
+    BAR_WIDTH = 30
+
+    def __init__(self) -> None:
+        self.total_consumed = 0
+        self.total_valid    = 0
+        self.total_invalid  = 0
+        self.total_batches  = 0
+        self.last_ticker    = "—"
+        self.last_date      = "—"
+        self.last_close     = "—"
+        self.start_time     = time.time()
+        self._lines         = 0
+
+    def update(
+        self,
+        consumed: int,
+        valid: int,
+        invalid: int,
+        last_ticker: str = "—",
+        last_date: str   = "—",
+        last_close: str  = "—",
+    ) -> None:
+        self.total_consumed += consumed
+        self.total_valid    += valid
+        self.total_invalid  += invalid
+        self.total_batches  += 1
+        self.last_ticker = last_ticker
+        self.last_date   = last_date
+        self.last_close  = last_close
+
+    def _bar(self, frac: float, ok: bool = True) -> str:
+        filled = int(self.BAR_WIDTH * frac)
+        ch = "█" if ok else "▓"
+        return ch * filled + "░" * (self.BAR_WIDTH - filled)
+
+    def render(self) -> None:
+        elapsed    = max(time.time() - self.start_time, 1e-9)
+        msg_s      = self.total_consumed / elapsed
+        valid_pct  = self.total_valid   / max(self.total_consumed, 1)
+        bad_pct    = self.total_invalid / max(self.total_consumed, 1)
+
+        lines = [
+            "",
+            "  ╔══════════════════════════════════════════════════════════╗",
+            "  ║          📥  US STOCKS KAFKA CONSUMER  📥               ║",
+            "  ╠══════════════════════════════════════════════════════════╣",
+            f"  ║  Consumed : {self.total_consumed:>12,}  │  Batches: {self.total_batches:<6}             ║",
+            f"  ║  Valid    : {self.total_valid:>12,}  [{self._bar(valid_pct, ok=True)}] {valid_pct*100:5.1f}%  ║",
+            f"  ║  Invalid  : {self.total_invalid:>12,}  [{self._bar(bad_pct,  ok=False)}] {bad_pct*100:5.1f}%  ║",
+            f"  ║  Speed    : {msg_s:>10,.0f} msg/s  │  Elapsed: {int(elapsed//60):02d}:{int(elapsed%60):02d}              ║",
+            f"  ║  Last     : ticker={self.last_ticker:<6}  date={self.last_date}  close={str(self.last_close):<10}  ║",
+            "  ╚══════════════════════════════════════════════════════════╝",
+            "",
+        ]
+
+        if self._lines:
+            sys.stdout.write(f"\033[{self._lines}A")
+
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        self._lines = len(lines)
 
 
 # ── Schema validation ─────────────────────────────────────────────────────────
@@ -86,24 +157,51 @@ class ValidationResult:
 
 
 def validate_event(event: dict[str, Any]) -> ValidationResult:
+    """
+    Validate one event against the canonical StockHistory schema.
+
+    Rules
+    ─────
+    1. All REQUIRED_FIELDS keys must be present.
+    2. Core OHLCV fields (NUMERIC_FIELDS) must be non-null valid floats.
+    3. Nullable indicator fields (NULLABLE_NUMERIC_FIELDS) may be null but,
+       when present, must be valid floats (not strings like "nan").
+    4. date must parse as YYYY-MM-DD.
+    5. high >= low (sanity check).
+    6. open, high, low, close must be > 0.
+    7. volume must be >= 0.
+    """
     errors: list[str] = []
     event_id = event.get("event_id")
     ticker   = event.get("ticker")
 
+    # ── 1. Required keys ──────────────────────────────────────────────────
     missing = REQUIRED_FIELDS - event.keys()
     if missing:
         errors.append(f"Missing fields: {sorted(missing)}")
 
+    # ── 2. Core OHLCV — must be non-null valid floats ─────────────────────
     for col in NUMERIC_FIELDS:
         val = event.get(col)
         if val is None:
-            errors.append(f"Null numeric field: {col}")
+            errors.append(f"Null required numeric: {col}")
             continue
         try:
             float(val)
         except (TypeError, ValueError):
-            errors.append(f"Non-numeric value for {col}: {val!r}")
+            errors.append(f"Non-numeric {col}={val!r}")
 
+    # ── 3. Nullable numerics — when present must be valid floats ──────────
+    for col in NULLABLE_NUMERIC_FIELDS:
+        val = event.get(col)
+        if val is None:
+            continue   # null is fine for indicator warm-up rows
+        try:
+            float(val)
+        except (TypeError, ValueError):
+            errors.append(f"Non-numeric {col}={val!r}")
+
+    # ── 4. Date format ────────────────────────────────────────────────────
     date_str = event.get("date")
     if date_str:
         try:
@@ -113,11 +211,25 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
     else:
         errors.append("date is null or missing")
 
+    # ── 5 & 6. Price sanity ───────────────────────────────────────────────
     try:
-        high = float(event.get("high", 0) or 0)
-        low  = float(event.get("low",  0) or 0)
+        high  = float(event.get("high",  0) or 0)
+        low   = float(event.get("low",   0) or 0)
+        open_ = float(event.get("open",  0) or 0)
+        close = float(event.get("close", 0) or 0)
         if high < low:
             errors.append(f"high ({high}) < low ({low})")
+        for name, val in (("open", open_), ("high", high), ("low", low), ("close", close)):
+            if val <= 0:
+                errors.append(f"{name} must be > 0, got {val}")
+    except (TypeError, ValueError):
+        pass
+
+    # ── 7. Volume ─────────────────────────────────────────────────────────
+    try:
+        vol = float(event.get("volume", 0) or 0)
+        if vol < 0:
+            errors.append(f"volume must be >= 0, got {vol}")
     except (TypeError, ValueError):
         pass
 
@@ -139,7 +251,10 @@ class BatchStats:
     invalid_msgs: int   = 0
     tickers_seen: set   = field(default_factory=set)
     start_time:   float = field(default_factory=time.time)
-    trigger:      str   = "?"    # "size" or "time"
+    trigger:      str   = "?"
+    last_ticker:  str   = "—"
+    last_date:    str   = "—"
+    last_close:   str   = "—"
 
     @property
     def elapsed(self) -> float:
@@ -157,7 +272,6 @@ def process_micro_batch(
     global_stats: dict,
     live: bool = False,
 ) -> BatchStats:
-    """Deserialise, validate, and tally a micro-batch of Kafka messages."""
     stats = BatchStats(batch_num=batch_num, trigger=trigger)
 
     for msg in messages:
@@ -174,19 +288,30 @@ def process_micro_batch(
         result = validate_event(event)
         ticker = result.ticker or "UNKNOWN"
         stats.tickers_seen.add(ticker)
+        stats.last_ticker = ticker
+        stats.last_date   = str(event.get("date", "—"))
+        stats.last_close  = str(event.get("close", "—"))
 
         if result.valid:
             stats.valid_msgs += 1
             global_stats["valid"] += 1
 
-            # --live mode: print each valid message as it arrives
             if live:
+                stochk = event.get("stochk_14_3_3")
+                stochd = event.get("stochd_14_3_3")
                 print(
-                    f"  ✅ event_id={result.event_id:<8} "
-                    f"ticker={ticker:<6} "
-                    f"date={event.get('date')}  "
-                    f"close={event.get('close')}  "
-                    f"volume={event.get('volume')}"
+                    f"  ✅ [{result.event_id:<8}] "
+                    f"{ticker:<6} "
+                    f"{event.get('date')}  "
+                    f"O={event.get('open'):<9}  "
+                    f"H={event.get('high'):<9}  "
+                    f"L={event.get('low'):<9}  "
+                    f"C={event.get('close'):<9}  "
+                    f"Vol={event.get('volume'):<12}  "
+                    f"Div={event.get('dividends'):<6}  "
+                    f"Split={event.get('stock_splits'):<5}  "
+                    f"K={f'{stochk:.2f}' if stochk is not None else 'n/a':<7}  "
+                    f"D={f'{stochd:.2f}' if stochd is not None else 'n/a'}"
                 )
         else:
             stats.invalid_msgs += 1
@@ -205,17 +330,12 @@ def process_micro_batch(
 def log_batch_summary(stats: BatchStats) -> None:
     pct_valid = (stats.valid_msgs / max(stats.total_msgs, 1)) * 100
     log.info(
-        "Batch %4d [%s-triggered] | msgs=%d  valid=%d (%.0f%%)  "
-        "invalid=%d  tickers=%d  %.2fs  %.0f msg/s",
-        stats.batch_num,
-        stats.trigger,
-        stats.total_msgs,
-        stats.valid_msgs,
-        pct_valid,
-        stats.invalid_msgs,
-        len(stats.tickers_seen),
-        stats.elapsed,
-        stats.throughput,
+        "Batch %4d [%s] | msgs=%d  valid=%d (%.0f%%)  invalid=%d  "
+        "tickers=%d  %.2fs  %.0f msg/s",
+        stats.batch_num, stats.trigger,
+        stats.total_msgs, stats.valid_msgs, pct_valid,
+        stats.invalid_msgs, len(stats.tickers_seen),
+        stats.elapsed, stats.throughput,
     )
 
 
@@ -271,7 +391,7 @@ def wait_for_topic(bootstrap: str, topic: str) -> None:
             log.warning("AdminClient error on attempt %d: %s", attempt, exc)
 
         log.warning(
-            "Topic '%s' not found yet (attempt %d/%d) — retrying in %ds …",
+            "Topic '%s' not found yet (%d/%d) — retrying in %ds …",
             topic, attempt, TOPIC_RETRY_ATTEMPTS, TOPIC_RETRY_DELAY,
         )
         time.sleep(TOPIC_RETRY_DELAY)
@@ -298,12 +418,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="US Stocks Kafka Consumer — real-time parallel mode"
     )
-    p.add_argument("--batch-size",  type=int,   default=MICRO_BATCH_SIZE,
-                   help="Flush batch when this many messages buffered")
-    p.add_argument("--max-wait-ms", type=int,   default=MAX_WAIT_MS,
-                   help="Flush batch after this many ms even if buffer not full")
-    p.add_argument("--timeout",     type=float, default=POLL_TIMEOUT,
-                   help="Kafka poll timeout in seconds")
+    p.add_argument("--batch-size",  type=int,   default=MICRO_BATCH_SIZE)
+    p.add_argument("--max-wait-ms", type=int,   default=MAX_WAIT_MS)
+    p.add_argument("--timeout",     type=float, default=POLL_TIMEOUT)
     p.add_argument("--group",       type=str,   default=None)
     p.add_argument("--topic",       type=str,   default=None)
     p.add_argument("--live",        action="store_true",
@@ -323,14 +440,8 @@ def main() -> None:
 
     log.info("=" * 62)
     log.info("  US Stocks Kafka Consumer  [PARALLEL REAL-TIME MODE]")
-    log.info("=" * 62)
-    log.info("  Broker       : %s", bootstrap)
-    log.info("  Topic        : %s", topic)
-    log.info("  Group        : %s", group)
-    log.info("  Batch size   : %d messages (size trigger)", args.batch_size)
-    log.info("  Max wait     : %d ms       (time trigger)", args.max_wait_ms)
-    log.info("  Live mode    : %s", "ON — printing every message" if args.live else "OFF")
-    log.info("  Design       : flushes on SIZE or TIME — whichever comes first")
+    log.info("  Broker: %s  |  Topic: %s  |  Group: %s", bootstrap, topic, group)
+    log.info("  Batch size: %d  |  Max wait: %d ms", args.batch_size, args.max_wait_ms)
     log.info("=" * 62)
 
     signal.signal(signal.SIGINT,  _handle_signal)
@@ -339,11 +450,15 @@ def main() -> None:
     wait_for_topic(bootstrap, topic)
     consumer = build_consumer(bootstrap, group, topic)
 
+    dash        = ConsumerDashboard()
     global_stats: dict = {"total": 0, "valid": 0, "invalid": 0, "batches": 0}
     batch_num   = 0
     buffer:  list[Message] = []
     max_wait_s  = args.max_wait_ms / 1000.0
-    batch_start = time.monotonic()   # clock for the time trigger
+    batch_start = time.monotonic()
+
+    # Initial render
+    dash.render()
 
     def _flush_buffer(trigger: str) -> None:
         nonlocal batch_num, buffer, batch_start
@@ -354,20 +469,30 @@ def main() -> None:
         stats = process_micro_batch(buffer, batch_num, trigger, global_stats, args.live)
         log_batch_summary(stats)
         consumer.commit(asynchronous=False)
-        buffer     = []
+
+        # Update and re-render the dashboard
+        dash.update(
+            consumed    = stats.total_msgs,
+            valid       = stats.valid_msgs,
+            invalid     = stats.invalid_msgs,
+            last_ticker = stats.last_ticker,
+            last_date   = stats.last_date,
+            last_close  = stats.last_close,
+        )
+        dash.render()
+
+        buffer      = []
         batch_start = time.monotonic()
 
     try:
         while _running:
             msg = consumer.poll(timeout=args.timeout)
 
-            # ── Time trigger: flush regardless of buffer fullness ──────────
             elapsed_since_flush = time.monotonic() - batch_start
             if elapsed_since_flush >= max_wait_s:
                 _flush_buffer(trigger="time")
 
             if msg is None:
-                # No new message — time trigger already handled above
                 continue
 
             if msg.error():
@@ -384,7 +509,6 @@ def main() -> None:
 
             buffer.append(msg)
 
-            # ── Size trigger: flush when buffer is full ───────────────────
             if len(buffer) >= args.batch_size:
                 _flush_buffer(trigger="size")
 
@@ -392,7 +516,6 @@ def main() -> None:
         log.error("Kafka error: %s", exc)
         sys.exit(1)
     finally:
-        # Drain any remaining buffered messages
         if buffer:
             _flush_buffer(trigger="shutdown")
 

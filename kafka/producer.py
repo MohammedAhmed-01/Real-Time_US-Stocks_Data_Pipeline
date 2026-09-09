@@ -7,13 +7,8 @@ Architecture:
   ┌──────────────────────┐     queue      ┌──────────────────────────┐
   │  DOWNLOAD THREAD     │ ─── (fname,df) ─▶  MAIN THREAD (producer) │
   │  downloads CSV files │               │  converts rows → events  │
-  │  one after another   │               │  flushes to Kafka now    │
-  └──────────────────────┘               └──────────────────────────┘
-
-  • Download of file N+1 starts while file N is still being produced.
-  • Memory is bounded — queue holds at most QUEUE_MAXSIZE DataFrames.
-  • Events flow into Kafka the moment each row is ready.
-  • Consumer can start reading immediately — no full-dataset wait.
+  │  flushes to Kafka    │               └──────────────────────────┘
+  └──────────────────────┘
 
 Usage:
     python producer.py [--speed FLOAT] [--batch-size INT] [--ticker SYMBOL]
@@ -62,18 +57,108 @@ DEFAULT_TOPIC    = "us-stocks-raw"
 DEFAULT_BROKER   = "localhost:9092"
 MICRO_BATCH_SIZE = 50
 SPEED_FACTOR     = 1.0
-QUEUE_MAXSIZE    = 3          # max DataFrames buffered between threads
-_SENTINEL        = object()   # signals download thread is done
+QUEUE_MAXSIZE    = 3
+_SENTINEL        = object()
 
-# Only stream files under this folder — the dataset also contains
-# Data/Congress/ (congressional trades) which has no OHLCV columns.
-STOCK_PATH_PREFIX = "data/stockhistory"   # lower-cased for comparison
+# Only stream files whose path (lower-cased) starts with this prefix.
+# The dataset also contains Data/Congress/ — those are skipped.
+STOCK_PATH_PREFIX = "data/stockhistory"
+
+# Real column names in every StockHistory CSV (after lower-casing):
+#   date, open, high, low, close, volume, dividends, stock_splits,
+#   stochk_14_3_3, stochd_14_3_3
+# Ticker is NOT a column — it comes from the filename (e.g. AAPL.csv → AAPL).
+#
+# A file is accepted only if it has ALL of these core columns.
+REQUIRED_STOCK_COLS = {"date", "open", "high", "low", "close", "volume"}
+
+
+# ── Dashboard helpers ─────────────────────────────────────────────────────────
+
+class Dashboard:
+    """
+    Thread-safe live progress dashboard printed to the terminal.
+    Rewrites a fixed block of lines so the terminal doesn't scroll.
+    """
+
+    BAR_WIDTH = 30
+
+    def __init__(self, total_files: int) -> None:
+        self.total_files   = total_files
+        self.done_files    = 0
+        self.current_file  = "—"
+        self.total_rows    = 0        # rows in current file
+        self.produced_rows = 0        # rows sent so far (across all files)
+        self.total_events  = 0        # running total events produced
+        self.skipped_files = 0
+        self.start_time    = time.time()
+        self._lock         = threading.Lock()
+        self._lines        = 0        # how many lines the last render used
+
+    # ── state updates (called from main thread) ────────────────────────────
+
+    def set_file(self, fname: str, nrows: int) -> None:
+        with self._lock:
+            self.current_file  = os.path.basename(fname)
+            self.total_rows    = nrows
+            self.produced_rows = 0
+
+    def add_events(self, n: int) -> None:
+        with self._lock:
+            self.produced_rows += n
+            self.total_events  += n
+
+    def file_done(self) -> None:
+        with self._lock:
+            self.done_files += 1
+
+    def file_skipped(self) -> None:
+        with self._lock:
+            self.skipped_files += 1
+
+    # ── rendering ─────────────────────────────────────────────────────────
+
+    def _bar(self, frac: float) -> str:
+        filled = int(self.BAR_WIDTH * frac)
+        return "█" * filled + "░" * (self.BAR_WIDTH - filled)
+
+    def render(self) -> None:
+        with self._lock:
+            elapsed   = max(time.time() - self.start_time, 1e-9)
+            ev_s      = self.total_events / elapsed
+            file_pct  = self.done_files / max(self.total_files, 1)
+            row_pct   = self.produced_rows / max(self.total_rows, 1)
+            remaining = self.total_files - self.done_files
+
+            lines = [
+                "",
+                "  ╔══════════════════════════════════════════════════════════╗",
+                "  ║          📈  US STOCKS KAFKA PRODUCER  📈               ║",
+                "  ╠══════════════════════════════════════════════════════════╣",
+                f"  ║  Files   : {self.done_files:>4} / {self.total_files:<4} done  "
+                f"│  Skipped : {self.skipped_files:<4}  │  Remaining: {remaining:<4}  ║",
+                f"  ║  Current : {self.current_file[:42]:<42}         ║",
+                f"  ║  File    : [{self._bar(row_pct)}] {row_pct*100:5.1f}%  ║",
+                f"  ║  Overall : [{self._bar(file_pct)}] {file_pct*100:5.1f}%  ║",
+                f"  ║  Events  : {self.total_events:>12,}  │  Speed: {ev_s:>8,.0f} ev/s  │  "
+                f"Elapsed: {int(elapsed//60):02d}:{int(elapsed%60):02d}  ║",
+                "  ╚══════════════════════════════════════════════════════════╝",
+                "",
+            ]
+
+        # Move cursor up to overwrite previous render
+        if self._lines:
+            sys.stdout.write(f"\033[{self._lines}A")
+
+        output = "\n".join(lines)
+        sys.stdout.write(output + "\n")
+        sys.stdout.flush()
+        self._lines = len(lines)
 
 
 # ── Kaggle auth ───────────────────────────────────────────────────────────────
 
 def _kaggle_auth() -> tuple[str, str]:
-    """Return (username, key) from env or ~/.kaggle/kaggle.json."""
     username = os.getenv("KAGGLE_USERNAME")
     key      = os.getenv("KAGGLE_KEY")
 
@@ -95,41 +180,28 @@ def _kaggle_auth() -> tuple[str, str]:
     return username, key
 
 
-# ── Kaggle: list files ────────────────────────────────────────────────────────
-
 def _kaggle_env() -> dict:
-    """Build env dict with KAGGLE_USERNAME/KEY injected for CLI subprocess calls."""
     username, key = _kaggle_auth()
     return {**os.environ, "KAGGLE_USERNAME": username, "KAGGLE_KEY": key}
 
 
+# ── Kaggle: list files ────────────────────────────────────────────────────────
+
 def list_kaggle_csv_files(dataset: str = KAGGLE_DATASET) -> list[str]:
-    """
-    Return sorted list of CSV filenames in the Kaggle dataset.
-
-    Uses the kaggle CLI (`kaggle datasets files <dataset> --csv`) which is
-    already installed via requirements.txt and works on every kaggle package
-    version (1.5, 1.6, 1.7 …).  No SDK import needed.
-
-    Falls back to the v1 REST API if the CLI is not on PATH.
-    """
-    log.info("Fetching file list for dataset '%s' via kaggle CLI …", dataset)
+    log.info("Fetching file list for dataset '%s' …", dataset)
 
     try:
         result = subprocess.run(
             ["kaggle", "datasets", "files", dataset, "--csv"],
-            capture_output=True,
-            text=True,
-            env=_kaggle_env(),
-            timeout=60,
+            capture_output=True, text=True,
+            env=_kaggle_env(), timeout=60,
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip())
 
-        # CLI output (--csv): header line then  name,size,creationDate
         lines = result.stdout.strip().splitlines()
         csv_files = []
-        for line in lines[1:]:          # skip header
+        for line in lines[1:]:
             name = line.split(",")[0].strip()
             if name.lower().endswith(".csv"):
                 csv_files.append(name)
@@ -144,14 +216,9 @@ def list_kaggle_csv_files(dataset: str = KAGGLE_DATASET) -> list[str]:
 
 
 def _list_csv_files_rest(dataset: str) -> list[str]:
-    """
-    REST fallback: GET /api/v1/datasets/{owner}/{slug}/files
-    Tries both the v1 JSON envelope and the older bare-list format.
-    """
     username, key = _kaggle_auth()
     owner, slug   = dataset.split("/", 1)
 
-    # Kaggle v1 — try the correct endpoint (note: no /files suffix in some versions)
     endpoints = [
         f"{KAGGLE_API_BASE}/datasets/{owner}/{slug}/files?page=1&pageSize=500",
         f"{KAGGLE_API_BASE}/datasets/{owner}/{slug}?fields=files",
@@ -165,7 +232,6 @@ def _list_csv_files_rest(dataset: str) -> list[str]:
             resp.raise_for_status()
             data = resp.json()
 
-            # Handle both {"datasetFiles":[...]} and bare list
             raw = data if isinstance(data, list) else (
                 data.get("datasetFiles") or data.get("files") or []
             )
@@ -188,7 +254,6 @@ def _list_csv_files_rest(dataset: str) -> list[str]:
 # ── Kaggle: download one CSV ──────────────────────────────────────────────────
 
 def _normalise_df(df: pd.DataFrame, filename: str) -> pd.DataFrame:
-    """Normalise column names and ensure a ticker column exists."""
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     if "ticker" not in df.columns and "symbol" not in df.columns:
         ticker = os.path.splitext(os.path.basename(filename))[0].upper()
@@ -198,20 +263,16 @@ def _normalise_df(df: pd.DataFrame, filename: str) -> pd.DataFrame:
     return df
 
 
-def download_single_csv(
-    filename: str,
-    dataset: str = KAGGLE_DATASET,
-) -> pd.DataFrame:
+def _is_stock_file(df: pd.DataFrame) -> bool:
     """
-    Download a single CSV from Kaggle and return a parsed DataFrame.
-
-    Strategy (tries in order, stops at first success):
-      1. kaggle CLI  → `kaggle datasets download -f <filename> --unzip`
-         Written to a temp dir so the container stays stateless.
-      2. REST download endpoint  → in-memory, handles ZIP wrapper.
-
-    Using the CLI as primary means we're immune to Kaggle API changes.
+    Return True only when the DataFrame has ALL required stock columns.
+    Columns are already lower-cased by _normalise_df at this point.
+    This rejects Congress/transaction files which lack open/high/low/close/volume.
     """
+    return REQUIRED_STOCK_COLS.issubset(set(df.columns))
+
+
+def download_single_csv(filename: str, dataset: str = KAGGLE_DATASET) -> pd.DataFrame:
     # ── Strategy 1: kaggle CLI ────────────────────────────────────────────
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -224,30 +285,22 @@ def download_single_csv(
                     "--unzip",
                     "--quiet",
                 ],
-                capture_output=True,
-                text=True,
-                env=_kaggle_env(),
-                timeout=120,
+                capture_output=True, text=True,
+                env=_kaggle_env(), timeout=120,
             )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "kaggle CLI returned non-zero")
 
-            # Walk tmpdir for the downloaded CSV (may be nested)
             for root, _dirs, files in os.walk(tmpdir):
                 for fname in files:
                     if fname.lower().endswith(".csv"):
-                        df = pd.read_csv(
-                            os.path.join(root, fname), low_memory=False
-                        )
+                        df = pd.read_csv(os.path.join(root, fname), low_memory=False)
                         return _normalise_df(df, filename)
 
             raise ValueError(f"CLI downloaded nothing recognisable for {filename}")
 
     except Exception as cli_err:
-        log.warning(
-            "kaggle CLI download failed for %s (%s) — trying REST …",
-            filename, cli_err,
-        )
+        log.warning("kaggle CLI download failed for %s (%s) — trying REST …", filename, cli_err)
 
     # ── Strategy 2: REST download endpoint ───────────────────────────────
     username, key = _kaggle_auth()
@@ -278,81 +331,132 @@ def download_single_csv(
 def _download_worker(
     csv_files: list[str],
     ticker_filter: Optional[str],
-    file_queue: "queue.Queue[tuple | object]",
+    file_queue: "queue.Queue",
+    dashboard: Dashboard,
 ) -> None:
-    """
-    Runs in a background thread.
-    Downloads each CSV sequentially and puts (fname, df) into the queue.
-    Puts _SENTINEL when done so the main thread knows to stop.
-
-    The queue's maxsize acts as back-pressure: if the producer is slower
-    than the downloader, the thread blocks here instead of consuming RAM.
-    """
     for fname in csv_files:
-        # Only process files inside Data/StockHistory/ — skip everything else
-        # (e.g. Data/Congress/houseTransactions.csv, senateTransactions.csv)
-        if not fname.lower().replace("\\", "/").startswith(STOCK_PATH_PREFIX):
-            log.info("[DL-THREAD] Skipping non-StockHistory file: %s", fname)
+        normalised = fname.lower().replace("\\", "/")
+
+        # ── Guard 1: path prefix — only StockHistory files ───────────────
+        if not normalised.startswith(STOCK_PATH_PREFIX):
+            log.info("[DL] Skipping non-StockHistory file: %s", fname)
+            dashboard.file_skipped()
             continue
 
+        # ── Guard 2: ticker filter ────────────────────────────────────────
         ticker_hint = os.path.splitext(os.path.basename(fname))[0].upper()
         if ticker_filter and ticker_hint != ticker_filter.upper():
+            dashboard.file_skipped()
             continue
 
-        log.info("[DL-THREAD] Downloading %s …", fname)
+        log.info("[DL] Downloading %s …", fname)
         try:
             df = download_single_csv(fname)
             if df.empty:
-                log.warning("[DL-THREAD] %s is empty — skipping", fname)
+                log.warning("[DL] %s is empty — skipping", fname)
+                dashboard.file_skipped()
                 continue
 
-            # Sort chronologically before queuing
+            # ── Guard 3: required column check ───────────────────────────
+            # Rejects any non-stock file regardless of path casing.
+            # StockHistory files have: date, open, high, low, close, volume,
+            # dividends, stock_splits, stochk_14_3_3, stochd_14_3_3
+            # Congress files have completely different columns → rejected here.
+            if not _is_stock_file(df):
+                log.warning(
+                    "[DL] %s missing required stock columns (found: %s) — skipping",
+                    fname, list(df.columns),
+                )
+                dashboard.file_skipped()
+                continue
+
             date_cols = [c for c in df.columns if c in ("date", "timestamp", "time")]
             if date_cols:
                 df = df.sort_values(date_cols[0], ascending=True)
 
-            log.info("[DL-THREAD] ✓ %s  (%d rows) → queued for producer", fname, len(df))
-            file_queue.put((fname, df))   # blocks if queue is full (back-pressure)
+            log.info("[DL] ✓ %s  (%d rows) → queued", fname, len(df))
+            file_queue.put((fname, df))
 
         except Exception as exc:
-            log.warning("[DL-THREAD] Skipping %s — %s", fname, exc)
+            log.warning("[DL] Skipping %s — %s", fname, exc)
+            dashboard.file_skipped()
 
-    # Signal main thread that there are no more files
     file_queue.put(_SENTINEL)
-    log.info("[DL-THREAD] All files downloaded. Thread exiting.")
+    log.info("[DL] All files downloaded. Thread exiting.")
 
 
 # ── Event schema ──────────────────────────────────────────────────────────────
+#
+# Real StockHistory CSV columns (after _normalise_df lower-cases them):
+#   date            – trading date  (YYYY-MM-DD)
+#   open            – opening price
+#   high            – intraday high
+#   low             – intraday low
+#   close           – closing price
+#   volume          – shares traded
+#   dividends       – cash dividend paid on this date (0.0 when none)
+#   stock_splits    – split ratio on this date        (0.0 when none)
+#   stochk_14_3_3   – Stochastic %K (14,3,3)
+#   stochd_14_3_3   – Stochastic %D (14,3,3)
+#
+# Ticker is NOT in the CSV — it is derived from the filename.
+# _normalise_df already inserts it as the "ticker" column.
 
 def row_to_event(row: pd.Series, source_file: str, event_id: int) -> dict:
-    """Convert a DataFrame row to the canonical JSON event schema."""
+    """
+    Convert one DataFrame row (already normalised by _normalise_df) into
+    the canonical JSON event that is written to Kafka.
+
+    All numeric fields use _safe() so NaN / None become JSON null rather
+    than the string "nan" or raising a serialisation error.
+    """
+
     def _safe(key: str) -> Optional[float]:
+        """Return float value or None — never NaN, never raises."""
         val = row.get(key)
-        if val is None or (isinstance(val, float) and pd.isna(val)):
+        if val is None:
             return None
+        # pandas represents missing numerics as float NaN
         try:
-            return float(val)
+            f = float(val)
+            return None if pd.isna(f) else f
         except (TypeError, ValueError):
             return None
 
-    date_val = None
-    for col in ("date", "timestamp", "time", "datetime"):
-        if col in row.index and row[col] and str(row[col]) != "nan":
-            date_val = str(row[col])[:10]
-            break
+    # Date column is always "date" after normalisation.
+    # Truncate to YYYY-MM-DD in case the raw value includes a time component.
+    raw_date = row.get("date")
+    date_val: Optional[str] = None
+    if raw_date is not None and str(raw_date) not in ("", "nan", "NaT"):
+        date_val = str(raw_date)[:10]
+
+    # Ticker was inserted by _normalise_df (from the filename, e.g. AAPL.csv → AAPL)
+    ticker = str(row.get("ticker", "UNKNOWN")).upper()
 
     return {
-        "event_id":    event_id,
-        "ticker":      str(row.get("ticker", row.get("symbol", "UNKNOWN"))).upper(),
-        "date":        date_val,
-        "open":        _safe("open"),
-        "high":        _safe("high"),
-        "low":         _safe("low"),
-        "close":       _safe("close"),
-        "adj_close":   _safe("adj_close") or _safe("adjusted_close"),
-        "volume":      _safe("volume"),
-        "source_file": source_file,
-        "produced_at": datetime.utcnow().isoformat() + "Z",
+        # ── Identity ──────────────────────────────────────────────────────
+        "event_id":       event_id,
+        "ticker":         ticker,
+        "date":           date_val,
+
+        # ── Core OHLCV ────────────────────────────────────────────────────
+        "open":           _safe("open"),
+        "high":           _safe("high"),
+        "low":            _safe("low"),
+        "close":          _safe("close"),
+        "volume":         _safe("volume"),
+
+        # ── Corporate actions ─────────────────────────────────────────────
+        "dividends":      _safe("dividends"),      # 0.0 on non-dividend days
+        "stock_splits":   _safe("stock_splits"),   # 0.0 on non-split days
+
+        # ── Technical indicators ──────────────────────────────────────────
+        "stochk_14_3_3":  _safe("stochk_14_3_3"),
+        "stochd_14_3_3":  _safe("stochd_14_3_3"),
+
+        # ── Pipeline metadata ─────────────────────────────────────────────
+        "source_file":    source_file,
+        "produced_at":    datetime.utcnow().isoformat() + "Z",
     }
 
 
@@ -389,12 +493,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="US Stocks Kafka Producer — parallel download + produce"
     )
-    p.add_argument("--speed",      type=float, default=SPEED_FACTOR,
-                   help="Speed multiplier (>1 = faster replay)")
-    p.add_argument("--batch-size", type=int,   default=MICRO_BATCH_SIZE,
-                   help="Rows per micro-batch")
-    p.add_argument("--ticker",     type=str,   default=None,
-                   help="Stream only this ticker symbol")
+    p.add_argument("--speed",      type=float, default=SPEED_FACTOR)
+    p.add_argument("--batch-size", type=int,   default=MICRO_BATCH_SIZE)
+    p.add_argument("--ticker",     type=str,   default=None)
     p.add_argument("--topic",      type=str,   default=None)
     return p.parse_args()
 
@@ -410,43 +511,46 @@ def main() -> None:
 
     log.info("=" * 62)
     log.info("  US Stocks Kafka Producer  [PARALLEL REAL-TIME MODE]")
-    log.info("=" * 62)
-    log.info("  Broker     : %s", bootstrap)
-    log.info("  Topic      : %s", topic)
-    log.info("  Speed      : %.1fx  |  Batch size: %d rows", args.speed, args.batch_size)
-    log.info("  Queue size : %d files (back-pressure buffer)", QUEUE_MAXSIZE)
-    log.info("  Mode       : download thread → queue → produce thread (parallel)")
+    log.info("  Broker: %s  |  Topic: %s", bootstrap, topic)
+    log.info("  Speed: %.1fx  |  Batch: %d rows", args.speed, args.batch_size)
     log.info("=" * 62)
 
-    # Step 1: Get file list (no data downloaded yet — fast)
     csv_files = list_kaggle_csv_files()
 
-    # Step 2: Start background download thread
+    # Count only stock files for the dashboard total
+    stock_files = [
+        f for f in csv_files
+        if f.lower().replace("\\", "/").startswith(STOCK_PATH_PREFIX)
+    ]
+    dashboard = Dashboard(total_files=len(stock_files))
+    log.info("Stock files to stream: %d  (skipping %d non-stock files)",
+             len(stock_files), len(csv_files) - len(stock_files))
+
     file_queue: "queue.Queue" = queue.Queue(maxsize=QUEUE_MAXSIZE)
     dl_thread = threading.Thread(
         target=_download_worker,
-        args=(csv_files, args.ticker, file_queue),
+        args=(csv_files, args.ticker, file_queue, dashboard),
         daemon=True,
         name="kaggle-downloader",
     )
     dl_thread.start()
-    log.info("Download thread started — producing starts as soon as first file arrives.")
 
-    # Step 3: Build Kafka producer
-    producer = build_producer(bootstrap)
-
-    # How long to sleep between micro-batches to simulate real-time pace
-    # (set to 0 for maximum throughput)
-    delay_per_batch = max(0.0, (args.batch_size / 252 / 6.5 / 3600) / max(args.speed, 0.01))
+    producer    = build_producer(bootstrap)
+    delay_per_batch = max(
+        0.0,
+        (args.batch_size / 252 / 6.5 / 3600) / max(args.speed, 0.01),
+    )
 
     total_events  = 0
     total_batches = 0
     event_id      = 0
     start_wall    = time.time()
 
+    # Initial dashboard render
+    dashboard.render()
+
     try:
         while True:
-            # Block until a file is ready (or done)
             item = file_queue.get()
 
             if item is _SENTINEL:
@@ -454,11 +558,8 @@ def main() -> None:
                 break
 
             fname, df = item
-            ticker_hint = os.path.splitext(os.path.basename(fname))[0].upper()
-            log.info(
-                "Producing  %s  |  %d rows  |  queue depth: %d",
-                fname, len(df), file_queue.qsize(),
-            )
+            dashboard.set_file(fname, len(df))
+            dashboard.render()
 
             batch: list[dict] = []
 
@@ -468,7 +569,6 @@ def main() -> None:
                 batch.append(event)
 
                 if len(batch) >= args.batch_size:
-                    # Produce the micro-batch to Kafka immediately
                     for ev in batch:
                         producer.produce(
                             topic=topic,
@@ -476,25 +576,20 @@ def main() -> None:
                             value=json.dumps(ev, default=str).encode(),
                             callback=delivery_callback,
                         )
-                    producer.poll(0)   # trigger delivery callbacks (non-blocking)
+                    producer.poll(0)
 
                     total_events  += len(batch)
                     total_batches += 1
+                    dashboard.add_events(len(batch))
                     batch = []
+
+                    # Refresh dashboard every batch
+                    dashboard.render()
 
                     if delay_per_batch > 0:
                         time.sleep(delay_per_batch)
 
-                    if total_batches % 20 == 0:
-                        elapsed = time.time() - start_wall
-                        log.info(
-                            "  ↳ Progress: %d batches | %d events | %.0f ev/s",
-                            total_batches,
-                            total_events,
-                            total_events / max(elapsed, 1e-9),
-                        )
-
-            # Flush remaining rows in the last partial batch
+            # Flush partial last batch
             if batch:
                 for ev in batch:
                     producer.produce(
@@ -506,7 +601,10 @@ def main() -> None:
                 producer.poll(0)
                 total_events  += len(batch)
                 total_batches += 1
+                dashboard.add_events(len(batch))
 
+            dashboard.file_done()
+            dashboard.render()
             log.info("  ✓ Finished producing %s", fname)
 
     except KeyboardInterrupt:
@@ -517,8 +615,12 @@ def main() -> None:
     finally:
         producer.flush(timeout=30)
         elapsed = time.time() - start_wall
+
+        # Final dashboard
+        dashboard.render()
+
         log.info("=" * 62)
-        log.info("  DONE")
+        log.info("  PRODUCER DONE")
         log.info("  Total events  : %d", total_events)
         log.info("  Total batches : %d", total_batches)
         log.info("  Wall time     : %.1f s", elapsed)
