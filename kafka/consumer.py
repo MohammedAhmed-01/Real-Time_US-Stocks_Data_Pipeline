@@ -1,20 +1,20 @@
 """
-Kafka Consumer — US Stock Dataset  [PARALLEL REAL-TIME MODE]
-============================================================
+consumer.py — US Stock Dataset Kafka Consumer (Parallel Real-Time Mode)
+=======================================================================
 M1 · Data & Kafka  |  Real-Time US Stocks Data Pipeline
 
 Micro-batch flushing is DUAL-TRIGGERED:
-  • Size trigger  — flush when buffer reaches --batch-size messages
-  • Time trigger  — flush every --max-wait-ms milliseconds
+    Size trigger  — flush when buffer reaches --batch-size messages
+    Time trigger  — flush every --max-wait-ms milliseconds
 
 Usage:
     python consumer.py [--batch-size INT] [--max-wait-ms INT]
                        [--timeout FLOAT] [--group GROUP] [--live]
 
-Environment variables (or .env file):
-    KAFKA_BOOTSTRAP  – Kafka broker(s), default localhost:9092
-    KAFKA_TOPIC      – Topic name,       default us-stocks-raw
-    KAFKA_GROUP_ID   – Consumer group,   default m1-validation-group
+Environment variables (or .env):
+    KAFKA_BOOTSTRAP   Broker list,     default localhost:9092
+    KAFKA_TOPIC       Source topic,    default us-stocks-raw
+    KAFKA_GROUP_ID    Consumer group,  default m1-validation-group
 """
 
 from __future__ import annotations
@@ -33,7 +33,11 @@ from typing import Any, Optional
 from confluent_kafka import Consumer, KafkaError, KafkaException, Message
 from dotenv import load_dotenv
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  [CONSUMER] %(levelname)-8s %(message)s",
@@ -41,35 +45,42 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-DEFAULT_TOPIC        = "us-stocks-raw"
-DEFAULT_BROKER       = "localhost:9092"
-DEFAULT_GROUP        = "m1-validation-group"
-MICRO_BATCH_SIZE     = 100
-MAX_WAIT_MS          = 2000
-POLL_TIMEOUT         = 0.5
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_TOPIC    = "us-stocks-raw"
+DEFAULT_BROKER   = "localhost:9092"
+DEFAULT_GROUP    = "m1-validation-group"
+MICRO_BATCH_SIZE = 100
+MAX_WAIT_MS      = 2000
+POLL_TIMEOUT     = 0.5
 
 TOPIC_RETRY_ATTEMPTS = 60
 TOPIC_RETRY_DELAY    = 5
 
-REQUIRED_FIELDS: frozenset[str] = frozenset({
-    "event_id", "ticker", "date",
-    "open", "high", "low", "close", "volume",
-    "dividends", "stock_splits",
-    "stochk_14_3_3", "stochd_14_3_3",
-    "source_file", "produced_at",
-})
-
-NUMERIC_FIELDS: frozenset[str] = frozenset({
+# Fields that must be present and parseable as float (never null)
+REQUIRED_NUMERIC_FIELDS: frozenset[str] = frozenset({
     "open", "high", "low", "close", "volume",
 })
 
+# Fields that may be null but must be float-parseable when present
 NULLABLE_NUMERIC_FIELDS: frozenset[str] = frozenset({
     "dividends", "stock_splits", "stochk_14_3_3", "stochd_14_3_3",
 })
 
+REQUIRED_FIELDS: frozenset[str] = frozenset({
+    "event_id", "ticker", "date",
+    *REQUIRED_NUMERIC_FIELDS,
+    *NULLABLE_NUMERIC_FIELDS,
+    "source_file", "produced_at",
+})
 
-# ── Schema validation ─────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Schema validation
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ValidationResult:
@@ -80,18 +91,18 @@ class ValidationResult:
 
 
 def validate_event(event: dict[str, Any]) -> ValidationResult:
-    """
-    Validate one event against the canonical StockHistory schema.
-    """
-    errors: list[str] = []
-    event_id = event.get("event_id")
-    ticker   = event.get("ticker")
+    """Validate one event against the canonical StockHistory schema."""
+    errors:   list[str]  = []
+    event_id: Optional[int] = event.get("event_id")
+    ticker:   Optional[str] = event.get("ticker")
 
+    # 1. Required fields presence
     missing = REQUIRED_FIELDS - event.keys()
     if missing:
         errors.append(f"Missing fields: {sorted(missing)}")
 
-    for col in NUMERIC_FIELDS:
+    # 2. Required numerics — must be non-null and parseable
+    for col in REQUIRED_NUMERIC_FIELDS:
         val = event.get(col)
         if val is None:
             errors.append(f"Null required numeric: {col}")
@@ -101,6 +112,7 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
         except (TypeError, ValueError):
             errors.append(f"Non-numeric {col}={val!r}")
 
+    # 3. Nullable numerics — must be parseable when present
     for col in NULLABLE_NUMERIC_FIELDS:
         val = event.get(col)
         if val is None:
@@ -110,6 +122,7 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
         except (TypeError, ValueError):
             errors.append(f"Non-numeric {col}={val!r}")
 
+    # 4. Date format
     date_str = event.get("date")
     if date_str:
         try:
@@ -119,18 +132,22 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
     else:
         errors.append("date is null or missing")
 
+    # 5. Price and volume sanity
     try:
         high  = float(event.get("high",  0) or 0)
         low   = float(event.get("low",   0) or 0)
         open_ = float(event.get("open",  0) or 0)
         close = float(event.get("close", 0) or 0)
+
         if high < low:
             errors.append(f"high ({high}) < low ({low})")
+
         for name, val in (("open", open_), ("high", high), ("low", low), ("close", close)):
             if val <= 0:
                 errors.append(f"{name} must be > 0, got {val}")
+
     except (TypeError, ValueError):
-        pass
+        pass  # already caught in step 2
 
     try:
         vol = float(event.get("volume", 0) or 0)
@@ -147,7 +164,9 @@ def validate_event(event: dict[str, Any]) -> ValidationResult:
     )
 
 
-# ── Micro-batch processing ────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Micro-batch statistics
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BatchStats:
@@ -171,6 +190,10 @@ class BatchStats:
         return self.total_msgs / max(self.elapsed, 1e-9)
 
 
+# ---------------------------------------------------------------------------
+# Batch processing
+# ---------------------------------------------------------------------------
+
 def process_micro_batch(
     messages: list[Message],
     batch_num: int,
@@ -178,6 +201,7 @@ def process_micro_batch(
     global_stats: dict,
     live: bool = False,
 ) -> BatchStats:
+    """Decode, validate, and optionally log every message in the batch."""
     stats = BatchStats(batch_num=batch_num, trigger=trigger)
 
     for msg in messages:
@@ -193,9 +217,10 @@ def process_micro_batch(
 
         result = validate_event(event)
         ticker = result.ticker or "UNKNOWN"
+
         stats.tickers_seen.add(ticker)
         stats.last_ticker = ticker
-        stats.last_date   = str(event.get("date", "—"))
+        stats.last_date   = str(event.get("date",  "—"))
         stats.last_close  = str(event.get("close", "—"))
 
         if result.valid:
@@ -207,12 +232,11 @@ def process_micro_batch(
                 stochd = event.get("stochd_14_3_3")
                 log.info(
                     "  OK  id=%-8s  ticker=%-6s  date=%s  "
-                    "O=%-9s H=%-9s L=%-9s C=%-9s  vol=%-12s  "
-                    "K=%s  D=%s",
+                    "O=%-9s H=%-9s L=%-9s C=%-9s  vol=%-12s  K=%s  D=%s",
                     result.event_id, ticker,
                     event.get("date"),
-                    event.get("open"), event.get("high"),
-                    event.get("low"),  event.get("close"),
+                    event.get("open"),  event.get("high"),
+                    event.get("low"),   event.get("close"),
                     event.get("volume"),
                     f"{stochk:.2f}" if stochk is not None else "n/a",
                     f"{stochd:.2f}" if stochd is not None else "n/a",
@@ -232,27 +256,27 @@ def process_micro_batch(
 
 
 def log_batch_summary(stats: BatchStats, global_stats: dict) -> None:
-    pct_valid  = stats.valid_msgs   / max(stats.total_msgs, 1) * 100
-    g_total    = global_stats["total"]
-    g_valid    = global_stats["valid"]
-    g_invalid  = global_stats["invalid"]
-    g_pct      = g_valid / max(g_total, 1) * 100
+    """Log a one-line summary for the completed batch."""
+    pct_valid = stats.valid_msgs / max(stats.total_msgs, 1) * 100
+    g_total   = global_stats["total"]
+    g_valid   = global_stats["valid"]
+    g_pct     = g_valid / max(g_total, 1) * 100
 
     log.info(
         "batch=%4d [%-8s]  msgs=%3d  valid=%3d (%5.1f%%)  invalid=%2d  "
         "tickers=%d  %.2fs  %7.0f msg/s  |  "
-        "total=%d  valid=%d (%.1f%%)  invalid=%d  "
-        "last=%s %s close=%s",
+        "total=%d  valid=%d (%.1f%%)  invalid=%d  last=%s %s close=%s",
         stats.batch_num, stats.trigger,
         stats.total_msgs, stats.valid_msgs, pct_valid,
         stats.invalid_msgs, len(stats.tickers_seen),
         stats.elapsed, stats.throughput,
-        g_total, g_valid, g_pct, g_invalid,
+        g_total, g_valid, g_pct, global_stats["invalid"],
         stats.last_ticker, stats.last_date, stats.last_close,
     )
 
 
 def log_global_summary(global_stats: dict) -> None:
+    """Log overall statistics when the consumer shuts down."""
     total   = global_stats["total"]
     valid   = global_stats["valid"]
     invalid = global_stats["invalid"]
@@ -267,10 +291,13 @@ def log_global_summary(global_stats: dict) -> None:
     log.info("=" * 62)
 
 
-# ── Kafka helpers ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Kafka consumer factory
+# ---------------------------------------------------------------------------
 
 def build_consumer(bootstrap_servers: str, group_id: str, topic: str) -> Consumer:
-    conf = {
+    """Return a configured confluent-kafka Consumer subscribed to *topic*."""
+    consumer = Consumer({
         "bootstrap.servers":    bootstrap_servers,
         "group.id":             group_id,
         "auto.offset.reset":    "earliest",
@@ -279,32 +306,30 @@ def build_consumer(bootstrap_servers: str, group_id: str, topic: str) -> Consume
         "session.timeout.ms":   30_000,
         "fetch.min.bytes":      1,
         "fetch.wait.max.ms":    500,
-    }
-    consumer = Consumer(conf)
+    })
     consumer.subscribe([topic])
     log.info("Subscribed to topic '%s'  group='%s'", topic, group_id)
     return consumer
 
 
 def wait_for_topic(bootstrap: str, topic: str) -> None:
+    """Block until *topic* appears in the cluster metadata, or raise on timeout."""
     from confluent_kafka.admin import AdminClient
 
-    log.info(
-        "Waiting for topic '%s' to appear (up to %d s) …",
-        topic, TOPIC_RETRY_ATTEMPTS * TOPIC_RETRY_DELAY,
-    )
+    deadline = TOPIC_RETRY_ATTEMPTS * TOPIC_RETRY_DELAY
+    log.info("Waiting for topic '%s' (up to %d s) …", topic, deadline)
+
     for attempt in range(1, TOPIC_RETRY_ATTEMPTS + 1):
         admin = AdminClient({"bootstrap.servers": bootstrap})
         try:
-            cluster_meta = admin.list_topics(timeout=10)
-            if topic in cluster_meta.topics:
+            if topic in admin.list_topics(timeout=10).topics:
                 log.info("Topic '%s' confirmed on broker.", topic)
                 return
         except Exception as exc:
             log.warning("AdminClient error on attempt %d: %s", attempt, exc)
 
         log.warning(
-            "Topic '%s' not found yet (%d/%d) — retrying in %ds …",
+            "Topic '%s' not found yet (%d/%d) — retrying in %d s …",
             topic, attempt, TOPIC_RETRY_ATTEMPTS, TOPIC_RETRY_DELAY,
         )
         time.sleep(TOPIC_RETRY_DELAY)
@@ -314,7 +339,9 @@ def wait_for_topic(bootstrap: str, topic: str) -> None:
     )
 
 
-# ── Graceful shutdown ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
 
 _running = True
 
@@ -325,27 +352,36 @@ def _handle_signal(signum, _frame) -> None:
     _running = False
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# CLI argument parsing
+# ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
         description="US Stocks Kafka Consumer — real-time parallel mode"
     )
-    p.add_argument("--batch-size",  type=int,   default=MICRO_BATCH_SIZE)
-    p.add_argument("--max-wait-ms", type=int,   default=MAX_WAIT_MS)
-    p.add_argument("--timeout",     type=float, default=POLL_TIMEOUT)
-    p.add_argument("--group",       type=str,   default=None)
-    p.add_argument("--topic",       type=str,   default=None)
-    p.add_argument("--live",        action="store_true",
-                   help="Print every valid message as it arrives")
-    return p.parse_args()
+    parser.add_argument("--batch-size",  type=int,   default=MICRO_BATCH_SIZE,
+                        help="Messages per batch (size trigger, default: 100)")
+    parser.add_argument("--max-wait-ms", type=int,   default=MAX_WAIT_MS,
+                        help="Max ms before a time-triggered flush (default: 2000)")
+    parser.add_argument("--timeout",     type=float, default=POLL_TIMEOUT,
+                        help="Kafka poll timeout in seconds (default: 0.5)")
+    parser.add_argument("--group",       type=str,   default=None,
+                        help="Override the consumer group ID")
+    parser.add_argument("--topic",       type=str,   default=None,
+                        help="Override the source topic")
+    parser.add_argument("--live",        action="store_true",
+                        help="Print every valid message as it arrives")
+    return parser.parse_args()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     load_dotenv()
-    args = parse_args()
+    args = _parse_args()
 
     bootstrap = os.getenv("KAFKA_BOOTSTRAP", DEFAULT_BROKER)
     topic     = args.topic or os.getenv("KAFKA_TOPIC",    DEFAULT_TOPIC)
@@ -366,10 +402,10 @@ def main() -> None:
     consumer = build_consumer(bootstrap, group, topic)
 
     global_stats: dict = {"total": 0, "valid": 0, "invalid": 0, "batches": 0}
-    batch_num   = 0
-    buffer:  list[Message] = []
-    max_wait_s  = args.max_wait_ms / 1000.0
-    batch_start = time.monotonic()
+    batch_num          = 0
+    buffer: list[Message] = []
+    max_wait_s         = args.max_wait_ms / 1000.0
+    batch_start        = time.monotonic()
 
     def _flush_buffer(trigger: str) -> None:
         nonlocal batch_num, buffer, batch_start
@@ -387,8 +423,7 @@ def main() -> None:
         while _running:
             msg = consumer.poll(timeout=args.timeout)
 
-            elapsed_since_flush = time.monotonic() - batch_start
-            if elapsed_since_flush >= max_wait_s:
+            if time.monotonic() - batch_start >= max_wait_s:
                 _flush_buffer(trigger="time")
 
             if msg is None:
@@ -397,8 +432,10 @@ def main() -> None:
             if msg.error():
                 code = msg.error().code()
                 if code == KafkaError._PARTITION_EOF:
-                    log.debug("End of partition %d @ offset %d",
-                              msg.partition(), msg.offset())
+                    log.debug(
+                        "End of partition %d @ offset %d",
+                        msg.partition(), msg.offset(),
+                    )
                 elif code == KafkaError.UNKNOWN_TOPIC_OR_PART:
                     log.warning("Topic not found mid-run — waiting 5 s …")
                     time.sleep(5)
@@ -417,7 +454,6 @@ def main() -> None:
     finally:
         if buffer:
             _flush_buffer(trigger="shutdown")
-
         consumer.close()
         log_global_summary(global_stats)
         log.info("Consumer closed.")
