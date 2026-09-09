@@ -1,0 +1,29 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  requirements.txt — M1 · Data & Kafka
+#  Real-Time US Stocks Data Pipeline
+#
+#  Install:
+#      pip install -r requirements.txt
+#
+#  Python 3.10 / 3.11 / 3.12  (all have pre-built wheels on Windows)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Kafka client
+confluent-kafka==2.4.0
+
+# Data processing — use >= to let pip pick the best pre-built wheel
+# (avoids the "build from source / vswhere.exe" error on Windows)
+pandas>=2.1.0
+numpy>=1.26.0
+
+# HTTP — streaming download from Kaggle API
+requests==2.32.3
+
+# Environment variable loading
+python-dotenv==1.0.1
+
+# Kaggle SDK (kaggle.json auth fallback)
+kaggle==1.6.14
+
+# Progress bar (optional, nice for long downloads)
+tqdm==4.66.4
