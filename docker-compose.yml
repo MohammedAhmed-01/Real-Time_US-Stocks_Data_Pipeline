@@ -170,6 +170,9 @@ services:
     restart: "no"
 
   # ── Producer (streams Kaggle → Kafka) ─────────────────────────────────────
+  # Stock_List.csv must be copied into the kafka/ folder alongside producer.py
+  # The ./kafka:/app mount makes it available at /app/Stock_List.csv inside
+  # the container — no extra volume entry needed.
   producer:
     build:
       context: .
@@ -195,8 +198,6 @@ services:
     command: ["python", "producer.py", "--rows-per-sec", "500", "--batch-size", "250", "--stock-list", "/app/Stock_List.csv"]
     volumes:
       - ./kafka:/app
-      # Mount Stock_List.csv from repo root into /app so producer can read it
-      - ./Stock_List.csv:/app/Stock_List.csv:ro
 
   # ── Consumer / validator ───────────────────────────────────────────────────
   consumer:

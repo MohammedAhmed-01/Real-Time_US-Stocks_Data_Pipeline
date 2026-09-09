@@ -74,7 +74,7 @@ DEFAULT_ROWS_PER_SEC = 1.0
 DEFAULT_BATCH_SIZE   = 50
 QUEUE_MAXSIZE        = 5
 
-STOCK_PATH_PREFIX    = "data/stockhistory"
+STOCK_PATH_PREFIX    = "Data/StockHistory"
 REQUIRED_STOCK_COLS  = {"date", "open", "high", "low", "close", "volume"}
 
 # Default location of the ticker list inside Docker (volume-mounted at /app)
