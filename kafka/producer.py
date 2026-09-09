@@ -13,6 +13,14 @@ File discovery:
     Default lookup path : /app/Stock_List.csv  (inside Docker)
     Override with       : --stock-list <path>
 
+    NOTE: Stock_List.csv is a broader ticker universe than what actually
+    exists in the Kaggle dataset (footballjoe789/us-stock-dataset). Some
+    symbols (e.g. warrant/unit variants like "AACBR", "AACIU") simply do
+    not have a corresponding CSV file in the dataset and will 404. This
+    is expected and handled as a permanent "not found" — see
+    KaggleFileNotFound below — rather than a transient error worth
+    retrying.
+
 Architecture:
     Download Thread  →  queue(fname, df)  →  Main Thread (producer)
 
@@ -88,6 +96,21 @@ _SENTINEL = object()
 
 
 # ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
+class KaggleFileNotFound(Exception):
+    """Raised when the dataset genuinely has no file at this path (HTTP 404).
+
+    This is a PERMANENT condition, not a transient one — retrying it
+    10 times with backoff (as used to happen) only wastes minutes per
+    missing ticker with zero chance of success. Callers should skip the
+    file immediately instead of retrying.
+    """
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Runtime statistics (thread-safe)
 # ---------------------------------------------------------------------------
 
@@ -96,6 +119,7 @@ class _Stats:
         self.total_files   = total_files
         self.done_files    = 0
         self.skipped_files = 0
+        self.not_found_files = 0
         self.total_events  = 0
         self.start_time    = time.time()
         self._lock         = threading.Lock()
@@ -110,6 +134,11 @@ class _Stats:
 
     def file_skipped(self) -> None:
         with self._lock:
+            self.skipped_files += 1
+
+    def file_not_found(self) -> None:
+        with self._lock:
+            self.not_found_files += 1
             self.skipped_files += 1
 
     def elapsed_str(self) -> str:
@@ -208,6 +237,13 @@ def _is_rate_limit_stderr(stderr: str) -> bool:
     return "429" in lowered or "too many requests" in lowered
 
 
+def _is_not_found_stderr(stderr: str) -> bool:
+    if not stderr:
+        return False
+    lowered = stderr.lower()
+    return "404" in lowered or "not found" in lowered
+
+
 def download_single_csv(
     filename: str,
     dataset: str = KAGGLE_DATASET,
@@ -237,6 +273,13 @@ def download_single_csv(
                                 time.sleep(min_delay_between_calls)
                                 return _normalise_df(df, filename)
 
+                # Permanent: file genuinely doesn't exist in the dataset —
+                # don't waste retries on it, fail fast.
+                if _is_not_found_stderr(result.stderr):
+                    raise KaggleFileNotFound(
+                        f"{filename} not present in dataset '{dataset}' (404)."
+                    )
+
                 if _is_rate_limit_stderr(result.stderr):
                     wait = min(RATE_LIMIT_MAX_WAIT, RATE_LIMIT_BASE_WAIT * attempt)
                     log.warning(
@@ -245,6 +288,8 @@ def download_single_csv(
                     )
                     time.sleep(wait)
                     continue
+        except KaggleFileNotFound:
+            raise
         except Exception as cli_err:
             log.warning("[DL] CLI attempt %d/%d failed for %s: %s",
                         attempt, max_retries, filename, cli_err)
@@ -254,6 +299,14 @@ def download_single_csv(
             username, key = _kaggle_auth()
             url  = f"{KAGGLE_API_BASE}/datasets/download/{dataset}/{filename}"
             resp = requests.get(url, auth=(username, key), stream=True, timeout=300)
+
+            # Permanent: 404 means the file isn't in the dataset at all.
+            # Retrying this 10x with backoff (the old behaviour) wastes
+            # minutes per missing ticker for zero benefit — fail fast instead.
+            if resp.status_code == 404:
+                raise KaggleFileNotFound(
+                    f"{filename} not present in dataset '{dataset}' (404)."
+                )
 
             if resp.status_code == 429:
                 wait = min(RATE_LIMIT_MAX_WAIT, RATE_LIMIT_BASE_WAIT * attempt)
@@ -280,6 +333,8 @@ def download_single_csv(
                 df = pd.read_csv(buf, low_memory=False)
                 time.sleep(min_delay_between_calls)
                 return _normalise_df(df, filename)
+        except KaggleFileNotFound:
+            raise
         except Exception as rest_err:
             log.warning("[DL] REST attempt %d/%d failed for %s: %s",
                         attempt, max_retries, filename, rest_err)
@@ -329,12 +384,24 @@ def _download_worker(
             log.info("[DL] Ready  file=%-30s  rows=%d", os.path.basename(fname), len(df))
             file_queue.put((fname, df))
 
+        except KaggleFileNotFound:
+            # Expected/permanent: this ticker just isn't in the dataset.
+            # Log at INFO (not ERROR) since it's not a failure of the pipeline,
+            # and move on immediately — no retries wasted.
+            log.info("[DL] %s not in dataset — skipping (no retries).", fname)
+            stats.file_not_found()
+            continue
+
         except Exception as exc:
             log.error("[DL] Permanently skipping %s after all retries: %s", fname, exc)
             stats.file_skipped()
 
     file_queue.put(_SENTINEL)
-    log.info("[DL] All files queued. Download thread done.")
+    log.info(
+        "[DL] All files queued. Download thread done. "
+        "(%d not found in dataset, %d skipped total)",
+        stats.not_found_files, stats.skipped_files,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -574,11 +641,12 @@ def main() -> None:
         elapsed = time.time() - start_wall
         log.info("=" * 62)
         log.info("  PRODUCER FINISHED")
-        log.info("  Total events  : %d", total_events)
-        log.info("  Files done    : %d / %d", stats.done_files, len(csv_files))
-        log.info("  Files skipped : %d", stats.skipped_files)
-        log.info("  Wall time     : %.1f s  (%s)", elapsed, stats.elapsed_str())
-        log.info("  Topic         : %s", topic)
+        log.info("  Total events   : %d", total_events)
+        log.info("  Files done     : %d / %d", stats.done_files, len(csv_files))
+        log.info("  Files skipped  : %d  (of which not-in-dataset: %d)",
+                  stats.skipped_files, stats.not_found_files)
+        log.info("  Wall time      : %.1f s  (%s)", elapsed, stats.elapsed_str())
+        log.info("  Topic          : %s", topic)
         log.info("=" * 62)
 
 
