@@ -1,0 +1,47 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+hs_err_pid*.log
+
+# Spark
+spark-events/
+*.lck
+
+# HDFS / Hadoop
+hdfs-data/
+namenode-data/
+datanode-data/
+checkpoints/
+
+# Data files
+*.csv
+*.parquet
+*.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+docker-data/
