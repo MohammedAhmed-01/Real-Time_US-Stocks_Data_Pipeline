@@ -20,9 +20,11 @@ Kept, unchanged in logic:
     - leakage / alignment audit
     - walk-forward (expanding window) validation with Huber
 
-Run:
-    spark-submit stock_return_pipeline.py \
-        --input hdfs://namenode:9000/clean/stock_history_parquet \
+Run (inside the Spark/HDFS docker network, same as the M2/M3 streaming job):
+    docker exec -it stocks-spark /opt/spark/bin/spark-submit \
+        --master spark://stocks-spark:7077 \
+        /opt/spark/work-dir/stock_return_pipeline.py \
+        --input hdfs://namenode:9000/stocks/clean \
         --output /mnt/outputs/ml_run_1 \
         --tickers AAPL,MSFT,GOOG,AMZN,META,NVDA,JPM,JNJ,XOM,PG
 
@@ -79,7 +81,7 @@ CONFIG = {
 COLUMN_MAP = {
     "ticker": "ticker",
     "date": "date",
-    "close": "adj_close",
+    "close": "close",
     "volume": "volume",
 }
 
