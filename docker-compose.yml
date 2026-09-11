@@ -412,7 +412,20 @@ services:
     volumes:
       - ./spark:/opt/spark/work-dir
 
-
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: stocks-pgadmin
+    restart: unless-stopped
+    networks:
+      - stocks-net
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL:    admin@stocks.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    depends_on:
+      postgres:
+        condition: service_healthy
 # ── Named volumes ──────────────────────────────────────────────────────────────
 volumes:
   kafka-1-data:

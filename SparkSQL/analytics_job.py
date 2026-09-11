@@ -23,6 +23,26 @@ Tables written to PostgreSQL (stocks_analytics):
   8.  stochastic_signals     — overbought / oversold counts
   9.  daily_market_breadth   — market-wide daily snapshot
   10. streaming_window_summary — 1-min window agg (if available)
+
+FIX (2026-09-12)
+----------------
+The previous code manually looped over ticker subdirectories and called
+reduce(DataFrame.union, ...) which blew up with NUM_COLUMNS_MISMATCH when
+any ticker's Parquet file had 13 columns instead of 14.
+
+Root cause: streaming_job.py writes with partitionBy("ticker"), which
+causes Spark to store ticker as a *directory name* (e.g. clean/ticker=AAPL/)
+rather than as a column inside the Parquet file.  When those partitioned
+files were later read with spark.read.parquet("s3a://stocks/clean/AAPL")
+and then union-ed manually, the ticker column was missing from some files.
+
+Fix: replace the manual loop + union with a single
+    spark.read.option("mergeSchema", "true").parquet(S3_CLEAN)
+call.  Spark reads all ticker partition directories at once, automatically
+injects ticker back from the partition path, and handles column-count
+differences across files via schema merging.  A defensive select then
+ensures exactly the 14 canonical columns are present (filling any that are
+genuinely absent with null).
 """
 
 from __future__ import annotations
@@ -31,10 +51,9 @@ import logging
 import os
 import sys
 import time
-from functools import reduce
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, input_file_name, lit, regexp_extract
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -67,6 +86,25 @@ S3_CLEAN      = f"s3a://{MINIO_BUCKET}/clean"
 S3_AGGREGATED = f"s3a://{MINIO_BUCKET}/aggregated"
 
 JDBC_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DB}"
+
+# The 14 canonical columns that every downstream query expects.
+# Order matters — this is also used for the defensive select below.
+_CLEAN_COLS = [
+    "event_id",
+    "ticker",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "dividends",
+    "stock_splits",
+    "stochk_14_3_3",
+    "stochd_14_3_3",
+    "source_file",
+    "produced_at",
+]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -142,37 +180,63 @@ log.info("  MinIO   : %s  bucket=%s", MINIO_ENDPOINT, MINIO_BUCKET)
 log.info("  Postgres: %s:%s/%s", PG_HOST, PG_PORT, PG_DB)
 log.info("=" * 62)
 
-# ── Clean (per-ticker Parquet) — read each ticker subfolder individually ──────
+# ── Clean Parquet — single read with schema merge (FIX) ──────────────────────
+#
+# Why this replaces the old manual loop + reduce(union):
+#
+#   streaming_job.py writes with .partitionBy("ticker"), so on disk the
+#   layout is:
+#       s3a://stocks/clean/ticker=AAPL/part-0.snappy.parquet   ← no ticker col
+#       s3a://stocks/clean/ticker=MSFT/part-0.snappy.parquet   ← no ticker col
+#       ...
+#   Spark automatically reconstructs the "ticker" partition column when you
+#   read the parent path.  The old per-ticker loop read individual
+#   subdirectories and then unioned them, losing that reconstruction for
+#   any ticker whose Parquet happened to be written without the ticker column
+#   explicitly in the file body.
+#
+#   spark.read.option("mergeSchema","true").parquet(S3_CLEAN) reads the
+#   entire partitioned dataset in one shot, injects "ticker" from the
+#   directory name, and merges any minor schema differences across files.
+#
+#   The defensive select at the end guarantees exactly _CLEAN_COLS are
+#   present regardless of how individual files were written.
+
 log.info("Loading clean data from %s …", S3_CLEAN)
 try:
-    jvm   = spark._jvm
-    jsc   = spark._jsc
-    fs    = jvm.org.apache.hadoop.fs.FileSystem.get(
-                jvm.java.net.URI.create(S3_CLEAN),
-                jsc.hadoopConfiguration())
-    path  = jvm.org.apache.hadoop.fs.Path(S3_CLEAN)
-    items = fs.listStatus(path)
+    raw_df = (
+        spark.read
+        .option("mergeSchema", "true")
+        .parquet(S3_CLEAN)
+    )
 
-    ticker_dfs = []
-    for item in items:
-        if item.isDirectory():
-            ticker_path = item.getPath().toString()
-            try:
-                ticker_dfs.append(spark.read.parquet(ticker_path))
-            except Exception as e:
-                log.warning("Skipping %s: %s", ticker_path, e)
+    # Safety net: if ticker column is still missing (e.g. non-partitioned
+    # layout without the column), derive it from the file path.
+    if "ticker" not in raw_df.columns:
+        log.warning(
+            "'ticker' column not found in raw schema — deriving from file path."
+        )
+        raw_df = raw_df.withColumn(
+            "ticker",
+            regexp_extract(input_file_name(), r"/clean/(?:ticker=)?([^/]+)/", 1),
+        )
 
-    if not ticker_dfs:
-        raise RuntimeError("No ticker directories found under " + S3_CLEAN)
-
-    clean_df = reduce(lambda a, b: a.union(b), ticker_dfs)
+    # Defensive select: keep exactly _CLEAN_COLS, fill missing ones with null.
+    select_exprs = [
+        col(c) if c in raw_df.columns else lit(None).alias(c)
+        for c in _CLEAN_COLS
+    ]
+    clean_df = raw_df.select(*select_exprs)
     clean_df.cache()
-    total_rows = clean_df.count()
+
+    total_rows   = clean_df.count()
+    total_tickers = clean_df.select("ticker").distinct().count()
     log.info(
         "Clean data loaded  rows=%d  tickers=%d",
         total_rows,
-        clean_df.select("ticker").distinct().count(),
+        total_tickers,
     )
+
 except Exception as exc:
     log.error("Cannot read clean data from MinIO: %s", exc)
     log.error("Run streaming_job.py first so it writes Parquet to MinIO.")
@@ -184,7 +248,7 @@ clean_df.createOrReplaceTempView("stocks")
 has_aggregated = False
 try:
     log.info("Loading aggregated data from %s …", S3_AGGREGATED)
-    agg_df = spark.read.parquet(S3_AGGREGATED)
+    agg_df = spark.read.option("mergeSchema", "true").parquet(S3_AGGREGATED)
     agg_flat = agg_df.select(
         col("window.start").alias("window_start"),
         col("window.end").alias("window_end"),
@@ -430,24 +494,24 @@ run_insight(
     sql="""
         SELECT
             ticker,
-            COUNT(*)                                                         AS rows_with_stoch,
-            SUM(CASE WHEN stochk_14_3_3 > 80 THEN 1 ELSE 0 END)             AS overbought_k,
-            SUM(CASE WHEN stochk_14_3_3 < 20 THEN 1 ELSE 0 END)             AS oversold_k,
+            COUNT(*)                                                          AS rows_with_stoch,
+            SUM(CASE WHEN stochk_14_3_3 > 80 THEN 1 ELSE 0 END)              AS overbought_k,
+            SUM(CASE WHEN stochk_14_3_3 < 20 THEN 1 ELSE 0 END)              AS oversold_k,
             SUM(CASE WHEN stochk_14_3_3 BETWEEN 20 AND 80 THEN 1 ELSE 0 END) AS neutral_k,
-            ROUND(AVG(stochk_14_3_3), 2)                                     AS avg_stochk,
-            ROUND(AVG(stochd_14_3_3), 2)                                     AS avg_stochd,
-            ROUND(MAX(stochk_14_3_3), 2)                                     AS max_stochk,
-            ROUND(MIN(stochk_14_3_3), 2)                                     AS min_stochk,
-            SUM(CASE WHEN stochk_14_3_3 > stochd_14_3_3 THEN 1 ELSE 0 END) AS k_above_d,
-            SUM(CASE WHEN stochk_14_3_3 < stochd_14_3_3 THEN 1 ELSE 0 END) AS k_below_d,
+            ROUND(AVG(stochk_14_3_3), 2)                                      AS avg_stochk,
+            ROUND(AVG(stochd_14_3_3), 2)                                      AS avg_stochd,
+            ROUND(MAX(stochk_14_3_3), 2)                                      AS max_stochk,
+            ROUND(MIN(stochk_14_3_3), 2)                                      AS min_stochk,
+            SUM(CASE WHEN stochk_14_3_3 > stochd_14_3_3 THEN 1 ELSE 0 END)  AS k_above_d,
+            SUM(CASE WHEN stochk_14_3_3 < stochd_14_3_3 THEN 1 ELSE 0 END)  AS k_below_d,
             ROUND(
                 SUM(CASE WHEN stochk_14_3_3 > 80 THEN 1 ELSE 0 END) * 100.0
                 / NULLIF(COUNT(*), 0),
-            2)                                                               AS overbought_rate_pct,
+            2)                                                                AS overbought_rate_pct,
             ROUND(
                 SUM(CASE WHEN stochk_14_3_3 < 20 THEN 1 ELSE 0 END) * 100.0
                 / NULLIF(COUNT(*), 0),
-            2)                                                               AS oversold_rate_pct
+            2)                                                                AS oversold_rate_pct
         FROM stocks
         WHERE stochk_14_3_3 IS NOT NULL
           AND stochd_14_3_3 IS NOT NULL
