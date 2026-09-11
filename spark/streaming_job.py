@@ -68,7 +68,7 @@ AGGREGATED_CHECKPOINT  = f"{S3_BASE}/checkpoints/aggregated"
 DEAD_LETTER_CHECKPOINT = f"{S3_BASE}/checkpoints/dead-letter"
 
 # ============================================================
-# 2. Spark Session
+# 2. Spark Session  — add these configs
 # ============================================================
 
 spark = (
@@ -85,11 +85,13 @@ spark = (
     .config("spark.hadoop.fs.s3a.multipart.size",           "104857600")
     .config("spark.hadoop.fs.s3a.block.size",               "33554432")
     .config("spark.sql.parquet.compression.codec", "snappy")
+    # ── FIXES ──────────────────────────────────────────────────────────────
+    .config("spark.sql.shuffle.partitions",     "6")   # match partition count; default 200 is lethal
+    .config("spark.network.timeout",            "300s")  # was 120s default — executor had 60s to respond
+    .config("spark.executor.heartbeatInterval", "20s")   # more frequent than the 60s timeout window
+    .config("spark.sql.streaming.stateStore.compression.codec", "lz4")
     .getOrCreate()
 )
-
-spark.sparkContext.setLogLevel("WARN")
-
 # ============================================================
 # 3. Canonical Event Schema
 # ============================================================
@@ -199,39 +201,36 @@ dead_letter_query = (
 )
 
 # ============================================================
-# 9. Clean Events → MinIO  (ONE Parquet file per ticker)
+# 9. Clean Events → MinIO  — rewrite foreachBatch to one job per batch
 # ============================================================
-
-_CLEAN_COLS = [
-    "event_id", "ticker", "date",
-    "open", "high", "low", "close", "volume",
-    "dividends", "stock_splits",
-    "stochk_14_3_3", "stochd_14_3_3",
-    "source_file", "produced_at",
-]
-
 
 def write_clean_batch(batch_df: DataFrame, batch_id: int) -> None:
     """
-    Merge incoming batch rows into one Parquet file per ticker in MinIO.
+    Write ALL tickers in a single batch with one Spark job, not one per ticker.
 
-    FIX: count new_rows BEFORE the overwrite write, not merged AFTER it.
+    OLD approach: loop over tickers → collect → filter → read existing →
+      union → dedup → write  (N Spark jobs for N tickers per batch — very slow)
 
-    The old code called merged.count() after .write.mode("overwrite"),
-    which deleted the old parquet file and then tried to re-read it
-    (because merged is lazy and still references the old file in its plan),
-    causing SparkFileNotFoundException and crashing the streaming query.
+    NEW approach:
+      1. Persist the incoming batch once.
+      2. Read ALL existing clean data that overlaps with tickers in this batch.
+      3. Union, dedup, sort — one Spark job.
+      4. Write partitioned by ticker — one write, one Spark job.
     """
     if batch_df.isEmpty():
         return
 
-    batch_clean = batch_df.select(_CLEAN_COLS)
+    batch_clean = batch_df.select(_CLEAN_COLS).persist()
 
-    tickers: list[str] = [
+    tickers = [
         row.ticker
         for row in batch_clean.select("ticker").distinct().collect()
         if row.ticker is not None
     ]
+
+    if not tickers:
+        batch_clean.unpersist()
+        return
 
     log.info(
         "batch_id=%d | tickers in batch: %d | %s",
@@ -239,53 +238,38 @@ def write_clean_batch(batch_df: DataFrame, batch_id: int) -> None:
         ", ".join(tickers[:10]) + ("…" if len(tickers) > 10 else ""),
     )
 
+    # Read only the affected ticker paths (avoids scanning all of /clean/)
+    existing_parts = []
     for ticker in tickers:
-        ticker_path = f"{CLEAN_PATH}/{ticker}"
-
-        new_rows = batch_clean.filter(col("ticker") == ticker)
-
-        # ── COUNT before the write ──────────────────────────────────────
-        # merged is a lazy plan that includes a reference to the existing
-        # parquet file (if any).  Calling .count() AFTER .write.mode("overwrite")
-        # would re-execute that plan against the now-deleted file and raise
-        # SparkFileNotFoundException.  Count only the new rows here; the
-        # merged total is no longer needed for logging.
-        new_row_count = new_rows.count()
-
         try:
-            existing = spark.read.parquet(ticker_path)
-            merged = (
-                existing
-                .union(new_rows)
-                .dropDuplicates(["event_id"])
-                .orderBy("date", "event_id")
-            )
+            existing_parts.append(spark.read.parquet(f"{CLEAN_PATH}/{ticker}"))
         except Exception:
-            merged = new_rows.orderBy("date", "event_id")
+            pass  # ticker has no existing data yet
 
-        # ── Write (overwrites old file; do NOT call merged.count() after this)
-        (
-            merged
-            .coalesce(1)
-            .write
-            .mode("overwrite")
-            .parquet(ticker_path)
+    if existing_parts:
+        from functools import reduce
+        existing = reduce(DataFrame.union, existing_parts)
+        merged = (
+            existing
+            .union(batch_clean)
+            .dropDuplicates(["event_id"])
+            .orderBy("date", "event_id")
         )
+    else:
+        merged = batch_clean.orderBy("date", "event_id")
 
-        log.info(
-            "batch_id=%d | ticker=%-6s | new_rows=%d | path=%s",
-            batch_id, ticker, new_row_count, ticker_path,
-        )
+    # Write all tickers in ONE Spark job, partitioned by ticker
+    (
+        merged
+        .repartition(len(tickers), col("ticker"))
+        .write
+        .mode("overwrite")
+        .partitionBy("ticker")
+        .parquet(CLEAN_PATH)
+    )
 
-
-valid_query = (
-    valid_df
-    .writeStream
-    .foreachBatch(write_clean_batch)
-    .option("checkpointLocation", CLEAN_CHECKPOINT)
-    .trigger(processingTime="30 seconds")
-    .start()
-)
+    batch_clean.unpersist()
+    log.info("batch_id=%d | wrote %d tickers to %s", batch_id, len(tickers), CLEAN_PATH)
 
 # ============================================================
 # 10. Windowed Aggregation → MinIO
