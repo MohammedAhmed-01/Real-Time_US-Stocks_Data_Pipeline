@@ -247,7 +247,9 @@ services:
 
   # ── Spark ─────────────────────────────────────────────────────────────────
   spark:
-    image: apache/spark:3.5.7
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: stocks-spark
     restart: unless-stopped
     networks:
@@ -267,7 +269,9 @@ services:
       - ./spark:/opt/spark/work-dir
 
   spark-worker:
-    image: apache/spark:3.5.7
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: stocks-spark-worker
     restart: unless-stopped
     networks:
@@ -331,4 +335,3 @@ networks:
   stocks-net:
     driver: bridge
     name: stocks-net
-
