@@ -245,11 +245,12 @@ services:
 
 
 
-  # ── Spark ─────────────────────────────────────────────────────────────────
+  # ── Spark ───────────────────────────────────────────────────────────────
   spark:
     build:
-      context: .
+      context: ./spark
       dockerfile: Dockerfile
+    image: stocks-spark:3.5.7
     container_name: stocks-spark
     restart: unless-stopped
     networks:
@@ -261,17 +262,20 @@ services:
         condition: service_healthy
       kafka-3:
         condition: service_healthy
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    command:
+      [
+        "/opt/spark/bin/spark-class",
+        "org.apache.spark.deploy.master.Master"
+      ]
     ports:
       - "7077:7077"
       - "8081:8080"
     volumes:
       - ./spark:/opt/spark/work-dir
 
+  # ── Spark Worker ────────────────────────────────────────────────────────
   spark-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: stocks-spark:3.5.7
     container_name: stocks-spark-worker
     restart: unless-stopped
     networks:
@@ -285,9 +289,7 @@ services:
         "spark://stocks-spark:7077"
       ]
     volumes:
-      - ./spark:/opt/spark/work-dir  
-
-
+      - ./spark:/opt/spark/work-dir
   # ── HDFS - NameNode & DataNode ─────────────────────────────────────────────────────────────────
 
   namenode:
