@@ -1,10 +1,13 @@
-# ⚡ Real-Time US Stocks Data Pipeline — Spark Streaming
+# ⚡ Real-Time US Stocks Data Pipeline — Spark Streaming (MinIO Edition)
 
-> **Spark Structured Streaming • Apache Kafka • HDFS • Parquet • Docker**
+> **Spark Structured Streaming • Apache Kafka • MinIO (S3) • Parquet • Docker**
 
 This module implements the **real-time Spark Streaming layer** of the US Stocks Data Pipeline.
 
-It consumes stock market events from Apache Kafka, applies a canonical schema and data-quality validation, routes invalid records to a Dead Letter Topic, stores valid events as partitioned Parquet files in HDFS, and performs **1-minute windowed aggregations** for downstream analytics.
+It consumes stock market events from Apache Kafka, applies a canonical schema and data-quality validation, routes invalid records to a Dead Letter Topic, stores valid events as partitioned Parquet files in **MinIO** (an S3-compatible object store), and performs **1-minute windowed aggregations** — all containerised with Docker.
+
+> **What changed from the HDFS version?**
+> `namenode` and `datanode` containers have been removed. All data and checkpoints that were previously stored under `hdfs://namenode:9000/stocks/…` are now stored under `s3a://stocks/…` inside a MinIO container. The Spark job uses the S3A file-system connector (bundled in `spark/Dockerfile`) to write directly to MinIO.
 
 ---
 
@@ -13,22 +16,15 @@ It consumes stock market events from Apache Kafka, applies a canonical schema an
 * [Overview](#-overview)
 * [Architecture](#-architecture)
 * [Technology Stack](#-technology-stack)
+* [MinIO Setup](#-minio-setup)
 * [Spark Configuration](#-spark-configuration)
 * [Kafka Input](#-kafka-input)
 * [Streaming Workflow](#-streaming-workflow)
-
-  * [1. Kafka Ingestion](#1-kafka-ingestion)
-  * [2. Schema Enforcement](#2-schema-enforcement)
-  * [3. Data Validation](#3-data-validation)
-  * [4. Dead Letter Handling](#4-dead-letter-handling)
-  * [5. Clean Data Layer](#5-clean-data-layer)
-  * [6. Windowed Aggregation](#6-windowed-aggregation)
-  * [7. Aggregated Data Layer](#7-aggregated-data-layer)
-* [HDFS Layout](#-hdfs-layout)
+* [MinIO Layout](#-minio-layout)
 * [Checkpointing & Fault Recovery](#-checkpointing--fault-recovery)
-* [Data Validation](#-data-validation)
 * [Running the Pipeline](#-running-the-pipeline)
 * [Reading the Output](#-reading-the-output)
+* [Useful MinIO Commands](#-useful-minio-commands)
 * [Handover to M3](#-handover-to-m3)
 * [Definition of Done](#-definition-of-done)
 
@@ -36,35 +32,15 @@ It consumes stock market events from Apache Kafka, applies a canonical schema an
 
 ## 🔎 Overview
 
-The Spark Streaming module is responsible for transforming the raw real-time Kafka stream into two reliable HDFS data layers:
-
-### Clean Layer
-
-Contains validated stock events in Parquet format.
-
 ```text
-Kafka → Spark → Validation → Clean Parquet → HDFS
-```
-
-### Aggregated Layer
-
-Contains ticker-level 1-minute streaming aggregations.
-
-```text
-Clean Events → 1-Minute Window → Aggregation → Parquet → HDFS
-```
-
-Invalid events are isolated through a Dead Letter Topic instead of being written to the clean layer.
-
-```text
-                         ┌── Valid ──→ Clean Parquet
-Kafka → Spark → Validate ┤
-                         └── Invalid → Dead Letter Topic
+Kafka → Spark → Validation → Clean Parquet  → MinIO  s3a://stocks/clean
+                           → 1-min Agg      → MinIO  s3a://stocks/aggregated
+                           → Invalid events → Kafka  us-stocks-dead-letter
 ```
 
 ---
 
-# 🏗️ Architecture
+## 🏗️ Architecture
 
 ```text
                     ┌──────────────────────┐
@@ -74,7 +50,7 @@ Kafka → Spark → Validate ┤
                                ▼
                     ┌──────────────────────┐
                     │    Apache Kafka      │
-                    │   us-stocks-raw     │
+                    │   us-stocks-raw      │
                     └──────────┬───────────┘
                                │
                                ▼
@@ -85,8 +61,7 @@ Kafka → Spark → Validate ┤
               │  • Parse JSON                   │
               │  • Apply Schema                 │
               │  • Validate Data                │
-              │  • Transform Events             │
-              │  • Window Aggregation            │
+              │  • Window Aggregation           │
               └───────────────┬─────────────────┘
                               │
                  ┌────────────┴────────────┐
@@ -97,43 +72,66 @@ Kafka → Spark → Validate ┤
        └────────┬─────────┘      └──────────┬──────────┘
                 │                           │
                 ▼                           ▼
-       ┌──────────────────┐       ┌────────────────────┐
-       │   Clean Parquet  │       │ Dead Letter Topic  │
-       └────────┬─────────┘       └────────────────────┘
-                │
-                ▼
-       ┌──────────────────────┐
-       │ 1-Minute Aggregation │
-       └──────────┬───────────┘
-                  │
-                  ▼
-       ┌──────────────────────┐
-       │ Aggregated Parquet   │
-       └──────────┬───────────┘
-                  │
-                  ▼
-             ┌─────────┐
-             │   HDFS  │
-             └─────────┘
+    ┌──────────────────────┐   ┌───────────────────────┐
+    │  MinIO               │   │  Dead Letter Kafka    │
+    │  s3a://stocks/clean  │   │  us-stocks-dead-letter│
+    └────────┬─────────────┘   └───────────────────────┘
+             │
+             ▼
+    ┌──────────────────────────┐
+    │  1-Minute Aggregation    │
+    └──────────┬───────────────┘
+               │
+               ▼
+    ┌────────────────────────────────┐
+    │  MinIO                         │
+    │  s3a://stocks/aggregated       │
+    └────────────────────────────────┘
 ```
 
 ---
 
-# 🧰 Technology Stack
+## 🧰 Technology Stack
 
 | Technology                     | Role                                 |
 | ------------------------------ | ------------------------------------ |
 | **Apache Spark 3.5.7**         | Stream processing & aggregation      |
 | **Spark Structured Streaming** | Continuous real-time processing      |
 | **Apache Kafka**               | Real-time event ingestion            |
-| **Hadoop HDFS**                | Distributed data storage             |
+| **MinIO**                      | S3-compatible distributed object store (replaces HDFS) |
+| **Hadoop S3A**                 | Spark ↔ MinIO file-system connector  |
 | **Parquet**                    | Columnar storage format              |
-| **Docker**                     | Containerized execution environment  |
+| **Docker**                     | Containerised execution environment  |
 | **PySpark**                    | Streaming application implementation |
 
 ---
 
-# ⚙️ Spark Configuration
+## 🪣 MinIO Setup
+
+MinIO is deployed as a single Docker container with a persistent named volume (`minio-data`).
+
+| Setting | Value |
+|---|---|
+| Container | `stocks-minio` |
+| S3 API port | `9000` (used by Spark) |
+| Web console | `http://localhost:9001` |
+| Default user | `minioadmin` |
+| Default password | `minioadmin` |
+| Bucket | `stocks` |
+
+The `minio-init` service runs once at startup to create the `stocks` bucket via the `mc` CLI. Spark then writes all Parquet files and checkpoints directly into that bucket.
+
+Override the defaults in your `.env` file:
+
+```env
+MINIO_ACCESS_KEY=your_access_key
+MINIO_SECRET_KEY=your_secret_key
+MINIO_BUCKET=stocks
+```
+
+---
+
+## ⚙️ Spark Configuration
 
 | Configuration    | Value                       |
 | ---------------- | --------------------------- |
@@ -141,657 +139,229 @@ Kafka → Spark → Validate ┤
 | Spark Service    | `spark`                     |
 | Spark Container  | `stocks-spark`              |
 | Spark Master     | `spark://stocks-spark:7077` |
-| Application Name | `USStocksStreaming`         |
+| Application Name | `USStocksStreaming`          |
 | Streaming Script | `spark/streaming_job.py`    |
+| S3A endpoint     | `http://minio:9000`         |
 
-Inside the Spark container:
+### Extra JARs bundled in `spark/Dockerfile`
 
-```text
-/opt/spark/work-dir/streaming_job.py
-```
-
----
-
-# 📨 Kafka Input
-
-The streaming application consumes events from:
-
-```text
-us-stocks-raw
-```
-
-Kafka brokers:
-
-```text
-kafka-1:29092
-kafka-2:29093
-kafka-3:29094
-```
-
-Topic configuration:
-
-```text
-Partitions: 6
-Replication Factor: 3
-```
-
-Spark reads the Kafka message value and converts it from binary to a string before parsing the JSON payload.
+| JAR | Purpose |
+|---|---|
+| `spark-sql-kafka-0-10_2.12-3.5.7.jar` | Kafka source connector |
+| `spark-token-provider-kafka-0-10_2.12-3.5.7.jar` | Kafka token provider |
+| `hadoop-aws-3.3.4.jar` | S3A file-system implementation |
+| `aws-java-sdk-bundle-1.12.262.jar` | AWS/S3 SDK (S3A runtime dependency) |
 
 ---
 
-# 🔄 Streaming Workflow
+## 📨 Kafka Input
 
-## 1. Kafka Ingestion
-
-The pipeline continuously reads events from the Kafka topic:
-
-```text
-us-stocks-raw
-```
-
-The Kafka stream is loaded using Spark Structured Streaming.
-
-```text
-Kafka
-  ↓
-Spark readStream
-  ↓
-JSON message
-```
+| Setting | Value |
+|---|---|
+| Topic | `us-stocks-raw` |
+| Brokers (internal) | `kafka-1:29092,kafka-2:29093,kafka-3:29094` |
+| Partitions | 6 |
+| Replication Factor | 3 |
 
 ---
 
-## 2. Schema Enforcement
+## 🔄 Streaming Workflow
 
-A predefined PySpark `StructType` is used to enforce a consistent schema.
+The workflow is identical to the HDFS version except all `hdfs://namenode:9000/…` paths are replaced with `s3a://stocks/…`.
 
-### Stock Event Schema
-
-```text
-event_id
-ticker
-date
-open
-high
-low
-close
-volume
-dividends
-stock_splits
-stochk_14_3_3
-stochd_14_3_3
-source_file
-produced_at
-```
-
-### Main Data Types
-
-| Field         | Type      |
-| ------------- | --------- |
-| `event_id`    | Long      |
-| `ticker`      | String    |
-| `date`        | Date      |
-| `open`        | Double    |
-| `high`        | Double    |
-| `low`         | Double    |
-| `close`       | Double    |
-| `volume`      | Double    |
-| `produced_at` | Timestamp |
-
-This guarantees that the incoming stream is processed using a predictable structure and data types.
-
-**Status:** ✅ Verified
+1. **Kafka Ingestion** — `readStream` from `us-stocks-raw`
+2. **JSON Parsing** — `from_json` with the canonical `StructType`
+3. **Validation** — required fields + numeric sanity checks → `is_valid` flag
+4. **Dead-Letter Routing** — invalid events → `us-stocks-dead-letter`
+5. **Clean Parquet** — valid events → `s3a://stocks/clean`, partitioned by `date`
+6. **Windowed Aggregation** — 1-minute tumbling window, 2-minute watermark
+7. **Aggregated Parquet** → `s3a://stocks/aggregated`, partitioned by `window_date`
 
 ---
 
-## 3. Data Validation
-
-Each parsed event is checked before entering the clean layer.
-
-### Required Fields
-
-The following fields must not be `NULL`:
+## 🗂️ MinIO Layout
 
 ```text
-event_id
-ticker
-date
-open
-high
-low
-close
-volume
-```
-
-### Numerical Validation
-
-The following values must be greater than or equal to zero:
-
-```text
-open   >= 0
-high   >= 0
-low    >= 0
-close  >= 0
-volume >= 0
-```
-
-Each record receives a validation flag:
-
-```text
-is_valid = true
-```
-
-or:
-
-```text
-is_valid = false
-```
-
-The stream is then separated into valid and invalid events.
-
----
-
-## 4. Dead Letter Handling
-
-Invalid events are redirected to a dedicated Kafka topic:
-
-```text
-us-stocks-dead-letter
-```
-
-This prevents invalid data from contaminating the clean HDFS layer while preserving the rejected events for debugging and monitoring.
-
-### Validation Test
-
-An intentionally invalid event was injected with:
-
-```text
-close = -50.0
-```
-
-The event was correctly rejected and appeared in:
-
-```text
-us-stocks-dead-letter
-```
-
-**Status:** ✅ Dead Letter Handling Verified
-
----
-
-## 5. Clean Data Layer
-
-Valid events are written to HDFS in **Parquet** format.
-
-### HDFS Path
-
-```text
-hdfs://namenode:9000/stocks/clean
-```
-
-### Partitioning
-
-The clean layer is partitioned by:
-
-```text
-date
-```
-
-### Directory Structure
-
-```text
-/stocks/clean/
-├── date=2026-09-09/
-│   └── *.snappy.parquet
-│
-└── date=2026-09-10/
-    └── *.snappy.parquet
-```
-
-Partitioning by date allows downstream systems to efficiently access data for specific dates.
-
-### Validation
-
-The clean Parquet output was successfully loaded and queried using Spark.
-
-Verified test count:
-
-```text
-250 records
-```
-
-**Status:** ✅ Clean Parquet Verified
-
----
-
-## 6. Windowed Aggregation
-
-The valid streaming data is also processed using a **1-minute tumbling window**.
-
-The aggregation is grouped by:
-
-```text
-window
-ticker
-```
-
-For every ticker and every 1-minute window, the pipeline calculates:
-
-### Average Closing Price
-
-```text
-avg_close
-```
-
-### Total Trading Volume
-
-```text
-total_volume
-```
-
-### Number of Events
-
-```text
-event_count
-```
-
-A **2-minute watermark** is configured to handle late-arriving events.
-
-### Aggregation Logic
-
-```text
-Valid Events
-     │
-     ▼
-1-Minute Window
-     │
-     ▼
-Group by Ticker
-     │
-     ├── Average Close
-     ├── Total Volume
-     └── Event Count
-```
-
----
-
-## 7. Aggregated Data Layer
-
-The aggregated results are stored as Parquet files in HDFS.
-
-### HDFS Path
-
-```text
-hdfs://namenode:9000/stocks/aggregated
-```
-
-### Partitioning
-
-The aggregation output is partitioned by:
-
-```text
-window_date
-```
-
-### Directory Structure
-
-```text
-/stocks/aggregated/
-├── window_date=2026-09-09/
-│   └── *.snappy.parquet
-│
-└── window_date=2026-09-10/
-    └── *.snappy.parquet
-```
-
----
-
-# 📊 Aggregated Schema
-
-The aggregated dataset contains:
-
-```text
-window
- ├── start : timestamp
- └── end   : timestamp
-
-ticker        : string
-avg_close     : double
-total_volume  : double
-event_count   : long
-window_date   : date
-```
-
-| Column         | Description                    |
-| -------------- | ------------------------------ |
-| `window.start` | Start of the 1-minute window   |
-| `window.end`   | End of the 1-minute window     |
-| `ticker`       | Stock ticker symbol            |
-| `avg_close`    | Average closing price          |
-| `total_volume` | Total volume in the window     |
-| `event_count`  | Number of events in the window |
-| `window_date`  | Partition date                 |
-
-Verified test count:
-
-```text
-906 aggregated records
-```
-
-**Status:** ✅ Aggregated Parquet Verified
-
----
-
-# 🗂️ HDFS Layout
-
-The Spark module uses the following HDFS structure:
-
-```text
-/stocks/
+stocks/                          ← bucket
 │
 ├── clean/
 │   └── date=YYYY-MM-DD/
-│       └── *.parquet
+│       └── *.snappy.parquet
 │
 ├── aggregated/
 │   └── window_date=YYYY-MM-DD/
-│       └── *.parquet
+│       └── *.snappy.parquet
 │
 └── checkpoints/
-    │
     ├── clean/
     ├── aggregated/
     └── dead-letter/
 ```
 
-### Main Paths
+### Path Reference
 
-| Purpose                | HDFS Path                                             |
-| ---------------------- | ----------------------------------------------------- |
-| Clean Data             | `hdfs://namenode:9000/stocks/clean`                   |
-| Aggregated Data        | `hdfs://namenode:9000/stocks/aggregated`              |
-| Clean Checkpoint       | `hdfs://namenode:9000/stocks/checkpoints/clean`       |
-| Aggregation Checkpoint | `hdfs://namenode:9000/stocks/checkpoints/aggregated`  |
-| Dead Letter Checkpoint | `hdfs://namenode:9000/stocks/checkpoints/dead-letter` |
-| NameNode               | `hdfs://namenode:9000`                                |
-
----
-
-# 💾 Checkpointing & Fault Recovery
-
-Checkpointing is implemented using HDFS.
-
-The aggregation checkpoint is:
-
-```text
-hdfs://namenode:9000/stocks/checkpoints/aggregated
-```
-
-The checkpoint stores Spark's streaming progress and state.
-
-The checkpoint directory contains state files including:
-
-```text
-.delta
-.snapshot
-```
-
-## Fault Recovery Test
-
-The recovery process was tested as follows:
-
-```text
-1. Start the Spark Streaming application.
-2. Allow the pipeline to process data.
-3. Stop the Spark application.
-4. Restart the same application.
-5. Keep the existing checkpoint.
-6. Verify that Spark starts successfully.
-7. Verify that new aggregated Parquet files are generated.
-```
-
-After restarting the application, new Parquet files appeared in HDFS.
-
-The checkpoint also continued to contain active state files.
-
-Therefore:
-
-> **Checkpoint-Based Fault Recovery: ✅ VERIFIED**
-
-The test confirms that Spark can recover its streaming state using the persisted HDFS checkpoint.
+| Purpose                | S3A Path                                                  |
+| ---------------------- | --------------------------------------------------------- |
+| Clean Data             | `s3a://stocks/clean`                                      |
+| Aggregated Data        | `s3a://stocks/aggregated`                                 |
+| Clean Checkpoint       | `s3a://stocks/checkpoints/clean`                          |
+| Aggregation Checkpoint | `s3a://stocks/checkpoints/aggregated`                     |
+| Dead-Letter Checkpoint | `s3a://stocks/checkpoints/dead-letter`                    |
+| MinIO API              | `http://minio:9000` (internal) / `http://localhost:9000`  |
+| MinIO Console          | `http://localhost:9001`                                   |
 
 ---
 
-# 🔍 Data Validation
+## 💾 Checkpointing & Fault Recovery
 
-Both output layers were successfully read using Spark.
+Checkpoints are stored in MinIO under `s3a://stocks/checkpoints/`. The S3A committer (`directory` mode) ensures atomic writes so partial checkpoint files do not corrupt state.
 
-### Clean Layer
+Recovery procedure is unchanged from the HDFS version:
 
-```scala
-val clean = spark.read.parquet(
-  "hdfs://namenode:9000/stocks/clean"
-)
+1. Stop the Spark application.
+2. Restart it with the same `--checkpointLocation` paths.
+3. Spark reads the existing checkpoint and resumes from where it left off.
+4. New Parquet files appear in `s3a://stocks/clean` and `s3a://stocks/aggregated`.
 
-clean.printSchema()
-clean.show(10, false)
-clean.count()
+---
+
+## ▶️ Running the Pipeline
+
+### 1 — Start the full stack
+
+```bash
+# Copy env template and set your credentials
+cp env.example .env
+# Edit .env: set KAGGLE_USERNAME, KAGGLE_KEY
+# MinIO credentials default to minioadmin/minioadmin — change for production
+
+docker compose up -d
 ```
 
-Expected verified test count:
+Services started: `kafka-1/2/3` → `kafka-init` → `minio` → `minio-init` → `producer` + `consumer` + `kafka-ui` + `spark` + `spark-worker`.
 
-```text
-250
+### 2 — Submit the streaming job
+
+```bash
+docker exec -it stocks-spark \
+  /opt/spark/bin/spark-submit \
+    --master spark://stocks-spark:7077 \
+    --conf spark.jars.ivy=/tmp/.ivy2 \
+    /opt/spark/work-dir/streaming_job.py
 ```
 
-### Aggregated Layer
+Because all JARs are pre-baked into the image (`spark/Dockerfile`), there is no need to pass `--packages` at submit time. The `--packages` flag is only needed if you are running `spark-submit` outside the container and want Maven to download JARs on the fly.
 
-```scala
-val agg = spark.read.parquet(
-  "hdfs://namenode:9000/stocks/aggregated"
-)
+### 3 — Test Kafka connectivity only
 
-agg.printSchema()
-agg.show(10, false)
-agg.count()
-```
-
-Expected verified test count:
-
-```text
-906
-```
-
-### Aggregation Date Range
-
-```scala
-import org.apache.spark.sql.functions._
-
-agg.select("window_date")
-   .agg(
-      min("window_date"),
-      max("window_date")
-   )
-   .show()
+```bash
+docker exec -it stocks-spark \
+  /opt/spark/bin/spark-submit \
+    --master spark://stocks-spark:7077 \
+    /opt/spark/work-dir/test_kafka.py
 ```
 
 ---
 
-# ▶️ Running the Streaming Pipeline
+## 🧪 Useful MinIO Commands
 
-Make sure the Docker services are running before starting Spark.
+All commands use the `mc` CLI inside the `minio-init` (or any `minio/mc`) container. You can also use the web console at `http://localhost:9001`.
 
-Run the streaming application with:
+### Browse bucket contents
 
-```powershell
-docker exec -it stocks-spark /opt/spark/bin/spark-submit --master spark://stocks-spark:7077 --conf spark.jars.ivy=/tmp/.ivy2 --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.7 /opt/spark/work-dir/streaming_job.py
+```bash
+docker run --rm --network stocks-net minio/mc \
+  alias set local http://minio:9000 minioadmin minioadmin
+
+# List all objects
+docker run --rm --network stocks-net minio/mc \
+  ls --recursive local/stocks
 ```
 
-The Kafka connector is:
+### Check clean output
 
-```text
-org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.7
+```bash
+docker run --rm --network stocks-net minio/mc \
+  ls local/stocks/clean/
 ```
 
-Its dependencies are cached under:
+### Check aggregated output
 
-```text
-/tmp/.ivy2
+```bash
+docker run --rm --network stocks-net minio/mc \
+  ls local/stocks/aggregated/
+```
+
+### Check checkpoints
+
+```bash
+docker run --rm --network stocks-net minio/mc \
+  ls --recursive local/stocks/checkpoints/
+```
+
+### Read Parquet with Spark (verification)
+
+```python
+# Run inside a PySpark shell pointed at the same MinIO instance
+df = spark.read.parquet("s3a://stocks/clean")
+df.printSchema()
+df.show(10, truncate=False)
+print(df.count())
+
+agg = spark.read.parquet("s3a://stocks/aggregated")
+agg.show(10, truncate=False)
+print(agg.count())
 ```
 
 ---
 
-# 🧪 Useful HDFS Commands
+## 🤝 Handover to M3
 
-### Check Clean Output
-
-```powershell
-docker exec stocks-namenode hdfs dfs -ls -R /stocks/clean
-```
-
-### Check Aggregated Output
-
-```powershell
-docker exec stocks-namenode hdfs dfs -ls -R /stocks/aggregated
-```
-
-### Check All Checkpoints
-
-```powershell
-docker exec stocks-namenode hdfs dfs -ls -R /stocks/checkpoints
-```
-
-### Check Aggregation Checkpoint
-
-```powershell
-docker exec stocks-namenode hdfs dfs -ls -R /stocks/checkpoints/aggregated
-```
-
----
-
-# 🤝 Handover to M3
-
-The **Spark Streaming and HDFS output layer is complete**.
-
-M3 does **not** need to rebuild the Kafka ingestion or Spark streaming pipeline.
-
-The downstream work can start directly from the generated HDFS Parquet datasets.
+The Spark Streaming and MinIO output layer is complete. M3 does **not** need to rebuild the Kafka ingestion or Spark streaming pipeline.
 
 ### For detailed valid events
 
-Use:
-
 ```text
-hdfs://namenode:9000/stocks/clean
+s3a://stocks/clean
 ```
-
-This contains validated individual stock events.
 
 ### For real-time aggregated data
 
-Use:
-
 ```text
-hdfs://namenode:9000/stocks/aggregated
+s3a://stocks/aggregated
 ```
 
-This contains:
+Fields: `window.start`, `window.end`, `ticker`, `avg_close`, `total_volume`, `event_count`, `window_date`.
 
-```text
-1-minute window
-+
-ticker
-+
-average close
-+
-total volume
-+
-event count
+### Connecting M3 to MinIO
+
+Any client that speaks the S3 protocol works. Configure it with:
+
 ```
-
-### Recommended Starting Point
-
-For downstream analytics and dashboards, start with:
-
-```text
-/stocks/aggregated
-```
-
-For detailed event-level analysis, use:
-
-```text
-/stocks/clean
+Endpoint : http://localhost:9000   (or http://minio:9000 inside Docker)
+Access key: minioadmin             (or your custom value from .env)
+Secret key: minioadmin
+Bucket    : stocks
 ```
 
 ---
 
-# ✅ Definition of Done
+## ✅ Definition of Done
 
-| Task                             | Status |
-| -------------------------------- | :----: |
-| Spark cluster configured         |    ✅   |
-| Kafka source configured          |    ✅   |
-| Canonical schema enforced        |    ✅   |
-| JSON parsing implemented         |    ✅   |
-| Data validation implemented      |    ✅   |
-| Invalid events handled           |    ✅   |
-| Dead Letter Topic tested         |    ✅   |
-| Windowed aggregation implemented |    ✅   |
-| HDFS checkpointing configured    |    ✅   |
-| Clean Parquet written            |    ✅   |
-| Aggregated Parquet written       |    ✅   |
-| HDFS partitioning implemented    |    ✅   |
-| Parquet schema validated         |    ✅   |
-| Parquet data queryable           |    ✅   |
-| Fault recovery tested            |    ✅   |
-| Handover documentation           |    ✅   |
-
----
-
-# 📁 Key Project File
-
-The complete Spark Streaming implementation is contained in:
-
-```text
-spark/
-└── streaming_job.py
-```
-
-The script contains:
-
-```text
-Kafka Source
-     ↓
-Schema
-     ↓
-Validation
-     ↓
-Dead Letter Stream
-     ↓
-Clean Parquet Stream
-     ↓
-Windowed Aggregation
-     ↓
-Aggregated Parquet
-```
-
----
-
-## 🎯 Final Status
-
-> **Spark Streaming Module: COMPLETE ✅**
-
-The pipeline successfully provides:
-
-* ⚡ Real-time Kafka ingestion
-* 🧩 Schema enforcement
-* 🔍 Data-quality validation
-* 🚨 Dead Letter handling
-* 🗄️ Clean Parquet storage
-* 📊 1-minute windowed aggregations
-* 💾 HDFS checkpointing
-* 🔄 Checkpoint-based fault recovery
-* 📦 Partitioned HDFS outputs
-* 🔎 Queryable Parquet datasets
-
-**Ready for downstream processing by M3.**
+| Task                                       | Status |
+| ------------------------------------------ | :----: |
+| Spark cluster configured                   |    ✅   |
+| Kafka source configured                    |    ✅   |
+| Canonical schema enforced                  |    ✅   |
+| JSON parsing implemented                   |    ✅   |
+| Data validation implemented                |    ✅   |
+| Invalid events routed to dead-letter topic |    ✅   |
+| Windowed aggregation implemented           |    ✅   |
+| MinIO deployed & bucket initialised        |    ✅   |
+| S3A connector bundled in Spark image       |    ✅   |
+| Clean Parquet written to MinIO             |    ✅   |
+| Aggregated Parquet written to MinIO        |    ✅   |
+| MinIO partitioning implemented             |    ✅   |
+| Checkpointing configured in MinIO          |    ✅   |
+| Fault recovery via checkpoint              |    ✅   |
+| Handover documentation updated             |    ✅   |

@@ -1,6 +1,14 @@
 ##############################################################################
-#  docker-compose.yml — Kafka Cluster (KRaft mode — NO ZooKeeper)
-#  M1 · Data & Kafka  |  Real-Time US Stocks Data Pipeline
+#  docker-compose.yml — Kafka Cluster + Spark + MinIO (replaces HDFS)
+#  M1 · Data & Kafka  +  M2 · Spark Streaming
+#  Real-Time US Stocks Data Pipeline
+#
+#  MinIO acts as an S3-compatible object store.  All data that was previously
+#  written to HDFS (clean Parquet, aggregated Parquet, checkpoints) is now
+#  written to MinIO via the Spark S3A connector.
+#
+#  MinIO console : http://localhost:9001   (user: minioadmin / minioadmin)
+#  MinIO API     : http://localhost:9000
 ##############################################################################
 
 services:
@@ -151,10 +159,17 @@ services:
         sleep 30
 
         echo '  Creating topic: us-stocks-raw'
-        kafka-topics --bootstrap-server kafka-1:29092 --create --if-not-exists --topic us-stocks-raw --partitions 6 --replication-factor 3 --config retention.ms=604800000 --config compression.type=lz4 --config min.insync.replicas=2
+        kafka-topics --bootstrap-server kafka-1:29092 --create --if-not-exists \
+          --topic us-stocks-raw --partitions 6 --replication-factor 3 \
+          --config retention.ms=604800000 \
+          --config compression.type=lz4 \
+          --config min.insync.replicas=2
 
         echo '  Creating topic: us-stocks-dead-letter'
-        kafka-topics --bootstrap-server kafka-1:29092 --create --if-not-exists --topic us-stocks-dead-letter --partitions 3 --replication-factor 3 --config retention.ms=2592000000 --config compression.type=lz4
+        kafka-topics --bootstrap-server kafka-1:29092 --create --if-not-exists \
+          --topic us-stocks-dead-letter --partitions 3 --replication-factor 3 \
+          --config retention.ms=2592000000 \
+          --config compression.type=lz4
 
         echo ''
         echo '  All topics:'
@@ -169,10 +184,57 @@ services:
         echo '--------------------------------------------------'
     restart: "no"
 
+  # ── MinIO — S3-compatible object store (replaces HDFS) ────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: stocks-minio
+    restart: unless-stopped
+    networks:
+      - stocks-net
+    ports:
+      - "9000:9000"    # S3 API  — used by Spark S3A connector
+      - "9001:9001"    # Web console — http://localhost:9001
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── MinIO bucket initialiser (runs once, then exits) ──────────────────────
+  # Creates the 'stocks' bucket and sets a public-read policy so Spark can
+  # write without needing per-request presigned URLs.
+  minio-init:
+    image: minio/mc:latest
+    container_name: stocks-minio-init
+    networks:
+      - stocks-net
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 \
+          "$${MINIO_ACCESS_KEY}" "$${MINIO_SECRET_KEY}"
+
+        # Create the stocks bucket if it doesn't already exist
+        mc mb --ignore-existing local/stocks
+
+        echo 'Bucket "stocks" is ready.'
+    restart: "no"
+
   # ── Producer (streams Kaggle → Kafka) ─────────────────────────────────────
-  # Stock_List.csv must be copied into the kafka/ folder alongside producer.py
-  # The ./kafka:/app mount makes it available at /app/Stock_List.csv inside
-  # the container — no extra volume entry needed.
   producer:
     build:
       context: .
@@ -191,11 +253,19 @@ services:
       kafka-init:
         condition: service_completed_successfully
     environment:
-      KAFKA_BOOTSTRAP:   kafka-1:29092,kafka-2:29093,kafka-3:29094
-      KAFKA_TOPIC:       us-stocks-raw
-      KAGGLE_USERNAME:   ${KAGGLE_USERNAME}
-      KAGGLE_KEY:        ${KAGGLE_KEY}
-    command: ["python", "producer.py", "--rows-per-sec", "500", "--batch-size", "250", "--stock-list", "/app/Stock_List.csv"]
+      KAFKA_BOOTSTRAP: kafka-1:29092,kafka-2:29093,kafka-3:29094
+      KAFKA_TOPIC:     us-stocks-raw
+      KAGGLE_USERNAME: ${KAGGLE_USERNAME}
+      KAGGLE_KEY:      ${KAGGLE_KEY}
+    command:
+      - python
+      - producer.py
+      - --rows-per-sec
+      - "500"
+      - --batch-size
+      - "250"
+      - --stock-list
+      - /app/Stock_List.csv
     volumes:
       - ./kafka:/app
 
@@ -218,10 +288,18 @@ services:
       kafka-init:
         condition: service_completed_successfully
     environment:
-      KAFKA_BOOTSTRAP:   kafka-1:29092,kafka-2:29093,kafka-3:29094
-      KAFKA_TOPIC:       us-stocks-raw
-      KAFKA_GROUP_ID:    m1-validation-group
-    command: ["python", "consumer.py", "--batch-size", "100", "--max-wait-ms", "5000", "--idle-timeout", "180"]
+      KAFKA_BOOTSTRAP: kafka-1:29092,kafka-2:29093,kafka-3:29094
+      KAFKA_TOPIC:     us-stocks-raw
+      KAFKA_GROUP_ID:  m1-validation-group
+    command:
+      - python
+      - consumer.py
+      - --batch-size
+      - "100"
+      - --max-wait-ms
+      - "5000"
+      - --idle-timeout
+      - "180"
     volumes:
       - ./kafka:/app
 
@@ -240,12 +318,10 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME:             us-stocks-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
-      KAFKA_CLUSTERS_0_AUDIT_TOPICAUDITENABLED:  "false"
-      DYNAMIC_CONFIG_ENABLED:                    "true"
+      KAFKA_CLUSTERS_0_AUDIT_TOPICAUDITENABLED: "false"
+      DYNAMIC_CONFIG_ENABLED:                   "true"
 
-
-
-  # ── Spark ───────────────────────────────────────────────────────────────
+  # ── Spark Master ───────────────────────────────────────────────────────────
   spark:
     build:
       context: ./spark
@@ -262,18 +338,23 @@ services:
         condition: service_healthy
       kafka-3:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     command:
-      [
-        "/opt/spark/bin/spark-class",
-        "org.apache.spark.deploy.master.Master"
-      ]
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
     ports:
       - "7077:7077"
-      - "8081:8080"
+      - "8081:8080"   # Spark Master web UI
+    environment:
+      MINIO_ENDPOINT:   http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET:     stocks
     volumes:
       - ./spark:/opt/spark/work-dir
 
-  # ── Spark Worker ────────────────────────────────────────────────────────
+  # ── Spark Worker ───────────────────────────────────────────────────────────
   spark-worker:
     image: stocks-spark:3.5.7
     container_name: stocks-spark-worker
@@ -283,54 +364,24 @@ services:
     depends_on:
       - spark
     command:
-      [
-        "/opt/spark/bin/spark-class",
-        "org.apache.spark.deploy.worker.Worker",
-        "spark://stocks-spark:7077"
-      ]
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://stocks-spark:7077
+    environment:
+      MINIO_ENDPOINT:   http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET:     stocks
     volumes:
       - ./spark:/opt/spark/work-dir
-  # ── HDFS - NameNode & DataNode ─────────────────────────────────────────────────────────────────
-
-  namenode:
-    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
-    container_name: stocks-namenode
-    environment:
-      - CLUSTER_NAME=stocks-cluster
-      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
-    ports:
-      - "9870:9870"
-      - "9000:9000"
-    volumes:
-      - namenode-data:/hadoop/dfs/name
-    networks:
-      - stocks-net
-
-  datanode:
-    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
-    container_name: stocks-datanode
-    environment:
-      - CLUSTER_NAME=stocks-cluster
-      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
-      - SERVICE_PRECONDITION=namenode:9870
-    depends_on:
-      - namenode
-    ports:
-      - "9864:9864"
-    volumes:
-      - datanode-data:/hadoop/dfs/data
-    networks:
-      - stocks-net
 
 
-
-# ── Volumes ────────────────────────────────────────────────────────────────────
+# ── Named volumes ──────────────────────────────────────────────────────────────
 volumes:
   kafka-1-data:
   kafka-2-data:
   kafka-3-data:
-  namenode-data:
-  datanode-data:
+  minio-data:       # replaces namenode-data + datanode-data
 
 # ── Network ────────────────────────────────────────────────────────────────────
 networks:
