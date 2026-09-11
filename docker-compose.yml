@@ -372,6 +372,8 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
       MINIO_BUCKET:     stocks
+      SPARK_WORKER_MEMORY: 4g  
+      SPARK_WORKER_CORES: 4
     volumes:
       - ./spark:/opt/spark/work-dir
 
