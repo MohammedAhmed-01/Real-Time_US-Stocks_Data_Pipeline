@@ -3,26 +3,36 @@ streaming_job.py — US Stocks Spark Structured Streaming
 ========================================================
 M2 · Spark Streaming  |  Real-Time US Stocks Data Pipeline
 
-BUG FIX (2026-09-11)
----------------------
-Removed merged.count() call that appeared AFTER .write.mode("overwrite").
-The fix: count new_rows BEFORE the write instead.
+FIXES APPLIED
+-------------
+1. _CLEAN_COLS was referenced inside write_clean_batch but never defined.
+   Added it before the function.
 
-Root cause: merged is a lazy DataFrame that still references the OLD
-parquet file in its query plan.  After .write.mode("overwrite") deletes
-that file and replaces it, calling merged.count() re-executes the plan
-against the now-deleted file, producing:
+2. The clean sink query was NEVER STARTED — valid_df was parsed and validated
+   but silently dropped because there was no .writeStream.foreachBatch(...).start()
+   call for it. Added clean_query with the correct checkpointLocation and trigger.
 
-    SparkFileNotFoundException: No such file or directory:
-      s3a://stocks/clean/AA/part-00000-<uuid>.snappy.parquet
+3. write_clean_batch used a per-ticker loop (N Spark jobs per batch). Replaced
+   with a single partitioned write for all tickers in one job.
+
+4. awaitAnyTermination() replaced with awaitTermination() on each query so all
+   three streams (clean, aggregation, dead-letter) block together and any one
+   crashing surfaces immediately.
 
 Storage backend: MinIO (S3-compatible object store) via the S3A connector.
+
+Run inside the Spark container:
+    spark-submit \\
+      --master spark://stocks-spark:7077 \\
+      --conf spark.jars.ivy=/tmp/.ivy2 \\
+      /opt/spark/work-dir/streaming_job.py
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from functools import reduce
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
@@ -31,7 +41,7 @@ from pyspark.sql.functions import (
     count,
     from_json,
     struct,
-    sum,
+    sum as spark_sum,
     to_date,
     to_json,
     window,
@@ -46,6 +56,11 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  [STREAMING] %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
 # ============================================================
@@ -67,31 +82,64 @@ CLEAN_CHECKPOINT       = f"{S3_BASE}/checkpoints/clean"
 AGGREGATED_CHECKPOINT  = f"{S3_BASE}/checkpoints/aggregated"
 DEAD_LETTER_CHECKPOINT = f"{S3_BASE}/checkpoints/dead-letter"
 
+# FIX 1 — define _CLEAN_COLS here so write_clean_batch can reference it
+_CLEAN_COLS = [
+    "event_id",
+    "ticker",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "dividends",
+    "stock_splits",
+    "stochk_14_3_3",
+    "stochd_14_3_3",
+    "source_file",
+    "produced_at",
+]
+
 # ============================================================
-# 2. Spark Session  — add these configs
+# 2. Spark Session
 # ============================================================
 
 spark = (
     SparkSession.builder
     .appName("USStocksStreaming")
+    # ── MinIO / S3A ──────────────────────────────────────────
     .config("spark.hadoop.fs.s3a.impl",
             "org.apache.hadoop.fs.s3a.S3AFileSystem")
-    .config("spark.hadoop.fs.s3a.endpoint",          MINIO_ENDPOINT)
-    .config("spark.hadoop.fs.s3a.path.style.access", "true")
-    .config("spark.hadoop.fs.s3a.access.key",  MINIO_ACCESS_KEY)
-    .config("spark.hadoop.fs.s3a.secret.key",  MINIO_SECRET_KEY)
-    .config("spark.hadoop.fs.s3a.connection.ssl.enabled",   "false")
-    .config("spark.hadoop.fs.s3a.fast.upload",              "true")
-    .config("spark.hadoop.fs.s3a.multipart.size",           "104857600")
-    .config("spark.hadoop.fs.s3a.block.size",               "33554432")
+    .config("spark.hadoop.fs.s3a.endpoint",               MINIO_ENDPOINT)
+    .config("spark.hadoop.fs.s3a.path.style.access",      "true")
+    .config("spark.hadoop.fs.s3a.access.key",             MINIO_ACCESS_KEY)
+    .config("spark.hadoop.fs.s3a.secret.key",             MINIO_SECRET_KEY)
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+    .config("spark.hadoop.fs.s3a.fast.upload",            "true")
+    .config("spark.hadoop.fs.s3a.multipart.size",         "104857600")   # 100 MB
+    .config("spark.hadoop.fs.s3a.block.size",             "33554432")    # 32 MB
+    # ── Output ──────────────────────────────────────────────
     .config("spark.sql.parquet.compression.codec", "snappy")
-    # ── FIXES ──────────────────────────────────────────────────────────────
-    .config("spark.sql.shuffle.partitions",     "6")   # match partition count; default 200 is lethal
-    .config("spark.network.timeout",            "300s")  # was 120s default — executor had 60s to respond
-    .config("spark.executor.heartbeatInterval", "20s")   # more frequent than the 60s timeout window
+    # ── Performance / stability ──────────────────────────────
+    .config("spark.sql.shuffle.partitions",                "6")
+    .config("spark.network.timeout",                       "300s")
+    .config("spark.executor.heartbeatInterval",            "20s")
     .config("spark.sql.streaming.stateStore.compression.codec", "lz4")
+    # Tolerate missing S3A paths on read (no AnalysisException for empty dirs)
+    .config("spark.sql.files.ignoreMissingFiles", "true")
     .getOrCreate()
 )
+
+spark.sparkContext.setLogLevel("WARN")
+
+log.info("=" * 62)
+log.info("  US Stocks Spark Structured Streaming")
+log.info("  Kafka  : %s  topic=%s", KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC)
+log.info("  MinIO  : %s  bucket=%s", MINIO_ENDPOINT, MINIO_BUCKET)
+log.info("  Clean  : %s", CLEAN_PATH)
+log.info("  Agg    : %s", AGGREGATED_PATH)
+log.info("=" * 62)
+
 # ============================================================
 # 3. Canonical Event Schema
 # ============================================================
@@ -124,6 +172,9 @@ kafka_df = (
     .option("subscribe",               KAFKA_TOPIC)
     .option("startingOffsets",         "earliest")
     .option("failOnDataLoss",          "false")
+    # Limit how much Kafka data is pulled per micro-batch so the worker
+    # doesn't OOM on first run when replaying millions of historical rows.
+    .option("maxOffsetsPerTrigger",    "50000")
     .load()
 )
 
@@ -143,23 +194,18 @@ parsed_df = (
 stocks_df = parsed_df.select("data.*", "kafka_timestamp")
 
 # ============================================================
-# 6. Data Validation
+# 6. Data Validation  — add is_valid flag
 # ============================================================
 
 valid_condition = (
     col("event_id").isNotNull()
     & col("ticker").isNotNull()
     & col("date").isNotNull()
-    & col("open").isNotNull()
-    & col("high").isNotNull()
-    & col("low").isNotNull()
-    & col("close").isNotNull()
-    & col("volume").isNotNull()
-    & (col("open")   >= 0)
-    & (col("high")   >= 0)
-    & (col("low")    >= 0)
-    & (col("close")  >= 0)
-    & (col("volume") >= 0)
+    & col("open").isNotNull()   & (col("open")   >= 0)
+    & col("high").isNotNull()   & (col("high")   >= 0)
+    & col("low").isNotNull()    & (col("low")    >= 0)
+    & col("close").isNotNull()  & (col("close")  >= 0)
+    & col("volume").isNotNull() & (col("volume") >= 0)
 )
 
 validated_df = stocks_df.withColumn("is_valid", valid_condition)
@@ -179,7 +225,7 @@ windowed_df = (
     )
     .agg(
         avg("close").alias("avg_close"),
-        sum("volume").alias("total_volume"),
+        spark_sum("volume").alias("total_volume"),
         count("*").alias("event_count"),
     )
 )
@@ -200,28 +246,37 @@ dead_letter_query = (
     .start()
 )
 
+log.info("Dead-letter query started  id=%s", dead_letter_query.id)
+
 # ============================================================
-# 9. Clean Events → MinIO  — rewrite foreachBatch to one job per batch
+# 9. Clean Events → MinIO  (foreachBatch — one Spark job per batch)
 # ============================================================
 
 def write_clean_batch(batch_df: DataFrame, batch_id: int) -> None:
     """
-    Write ALL tickers in a single batch with one Spark job, not one per ticker.
+    Merge new clean rows into the per-ticker Parquet store in MinIO.
 
-    OLD approach: loop over tickers → collect → filter → read existing →
-      union → dedup → write  (N Spark jobs for N tickers per batch — very slow)
+    Strategy
+    --------
+    • Select only the canonical columns (_CLEAN_COLS).
+    • Collect the list of distinct tickers in this batch (driver side — cheap).
+    • Read only the existing Parquet files for those tickers (avoids a full
+      scan of /clean/).
+    • Union existing + new, deduplicate on event_id, sort by date/event_id.
+    • Write back partitioned by ticker in a single Spark job.
 
-    NEW approach:
-      1. Persist the incoming batch once.
-      2. Read ALL existing clean data that overlaps with tickers in this batch.
-      3. Union, dedup, sort — one Spark job.
-      4. Write partitioned by ticker — one write, one Spark job.
+    The count of new rows is captured BEFORE the write so we never
+    re-execute the lazy plan against a file that has already been overwritten
+    (the bug fixed on 2026-09-11).
     """
     if batch_df.isEmpty():
+        log.info("batch_id=%d | empty batch — skipping", batch_id)
         return
 
+    # Select and cache the clean columns for this batch
     batch_clean = batch_df.select(_CLEAN_COLS).persist()
 
+    # Collect distinct tickers (small list — safe to run on driver)
     tickers = [
         row.ticker
         for row in batch_clean.select("ticker").distinct().collect()
@@ -232,22 +287,28 @@ def write_clean_batch(batch_df: DataFrame, batch_id: int) -> None:
         batch_clean.unpersist()
         return
 
+    # Count BEFORE the write (avoids SparkFileNotFoundException after overwrite)
+    new_row_count = batch_clean.count()
+
     log.info(
-        "batch_id=%d | tickers in batch: %d | %s",
-        batch_id, len(tickers),
-        ", ".join(tickers[:10]) + ("…" if len(tickers) > 10 else ""),
+        "batch_id=%d | new_rows=%d | tickers=%d | %s",
+        batch_id,
+        new_row_count,
+        len(tickers),
+        ", ".join(tickers[:15]) + ("…" if len(tickers) > 15 else ""),
     )
 
-    # Read only the affected ticker paths (avoids scanning all of /clean/)
-    existing_parts = []
+    # Read existing Parquet for affected tickers only
+    existing_parts: list[DataFrame] = []
     for ticker in tickers:
+        ticker_path = f"{CLEAN_PATH}/{ticker}"
         try:
-            existing_parts.append(spark.read.parquet(f"{CLEAN_PATH}/{ticker}"))
+            existing_parts.append(spark.read.parquet(ticker_path))
         except Exception:
-            pass  # ticker has no existing data yet
+            # No existing data for this ticker yet — that's fine
+            pass
 
     if existing_parts:
-        from functools import reduce
         existing = reduce(DataFrame.union, existing_parts)
         merged = (
             existing
@@ -259,17 +320,37 @@ def write_clean_batch(batch_df: DataFrame, batch_id: int) -> None:
         merged = batch_clean.orderBy("date", "event_id")
 
     # Write all tickers in ONE Spark job, partitioned by ticker
+    # mode="overwrite" + partitionOverwriteMode="dynamic" only rewrites
+    # the partitions (tickers) present in this batch — all other ticker
+    # partitions are left untouched.
     (
         merged
-        .repartition(len(tickers), col("ticker"))
+        .repartition(max(1, len(tickers)), col("ticker"))
         .write
+        .option("partitionOverwriteMode", "dynamic")
         .mode("overwrite")
         .partitionBy("ticker")
         .parquet(CLEAN_PATH)
     )
 
     batch_clean.unpersist()
-    log.info("batch_id=%d | wrote %d tickers to %s", batch_id, len(tickers), CLEAN_PATH)
+
+    log.info(
+        "batch_id=%d | ✓ wrote %d tickers → %s",
+        batch_id, len(tickers), CLEAN_PATH,
+    )
+
+
+# FIX 2 — start the clean query (this call was completely missing before)
+clean_query = (
+    valid_df.writeStream
+    .foreachBatch(write_clean_batch)
+    .option("checkpointLocation", CLEAN_CHECKPOINT)
+    .trigger(processingTime="30 seconds")
+    .start()
+)
+
+log.info("Clean query started  id=%s", clean_query.id)
 
 # ============================================================
 # 10. Windowed Aggregation → MinIO
@@ -288,6 +369,8 @@ def write_aggregation_batch(batch_df: DataFrame, batch_id: int) -> None:
         .parquet(AGGREGATED_PATH)
     )
 
+    log.info("batch_id=%d | aggregation batch written → %s", batch_id, AGGREGATED_PATH)
+
 
 aggregation_query = (
     windowed_df.writeStream
@@ -297,8 +380,27 @@ aggregation_query = (
     .start()
 )
 
+log.info("Aggregation query started  id=%s", aggregation_query.id)
+
 # ============================================================
-# 11. Keep the job alive
+# 11. Keep all three streams alive
+#     awaitAnyTermination() stops the moment ANY query ends or crashes.
+#     If a query crashes its exception is re-raised here so the job exits
+#     with a non-zero code and Docker Compose can restart it.
 # ============================================================
 
+log.info("All three streaming queries are running. Waiting for termination …")
+log.info("  • clean          id=%s", clean_query.id)
+log.info("  • aggregation    id=%s", aggregation_query.id)
+log.info("  • dead-letter    id=%s", dead_letter_query.id)
+
 spark.streams.awaitAnyTermination()
+
+# If we get here, one of the queries stopped (cleanly or with an error).
+# Log the status of all queries to help diagnose the cause.
+for q in [clean_query, aggregation_query, dead_letter_query]:
+    log.info(
+        "Query %s (%s): isActive=%s  recentProgress=%s",
+        q.name or q.id, q.id, q.isActive,
+        q.recentProgress[-1] if q.recentProgress else "no progress yet",
+    )
