@@ -7,6 +7,7 @@
 #   • commons-pool2               (REQUIRED by kafka-clients — was missing!)
 #   • hadoop-aws                  (S3A file system for MinIO)
 #   • aws-java-sdk-bundle         (S3A runtime dependency)
+#   • postgresql                  (JDBC driver for PostgreSQL — M3 analytics)
 # =============================================================================
 
 FROM apache/spark:3.5.7
@@ -45,6 +46,12 @@ RUN curl -L -o /opt/spark/jars/hadoop-aws-3.3.4.jar \
 
 RUN curl -L -o /opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar \
     https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar
+
+# ---------------------------------------------------------------------------
+# PostgreSQL JDBC driver — used by analytics_job.py to write insight tables
+# ---------------------------------------------------------------------------
+RUN curl -L -o /opt/spark/jars/postgresql-42.7.3.jar \
+    https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar
 
 # ---------------------------------------------------------------------------
 # Drop back to the non-root Spark user (uid 185)

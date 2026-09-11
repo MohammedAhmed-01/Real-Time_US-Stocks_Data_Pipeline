@@ -1,14 +1,16 @@
 ##############################################################################
-#  docker-compose.yml — Kafka Cluster + Spark + MinIO (replaces HDFS)
-#  M1 · Data & Kafka  +  M2 · Spark Streaming
+#  docker-compose.yml — Kafka Cluster + Spark + MinIO + PostgreSQL
+#  M1 · Data & Kafka  +  M2 · Spark Streaming  +  M3 · SparkSQL Analytics
 #  Real-Time US Stocks Data Pipeline
 #
-#  MinIO acts as an S3-compatible object store.  All data that was previously
-#  written to HDFS (clean Parquet, aggregated Parquet, checkpoints) is now
-#  written to MinIO via the Spark S3A connector.
+#  MinIO acts as an S3-compatible object store for Parquet data.
+#  PostgreSQL stores SparkSQL analytics output (analytics_job.py).
 #
-#  MinIO console : http://localhost:9001   (user: minioadmin / minioadmin)
-#  MinIO API     : http://localhost:9000
+#  MinIO console  : http://localhost:9001   (minioadmin / minioadmin)
+#  MinIO API      : http://localhost:9000
+#  Spark Master   : http://localhost:8081
+#  Kafka UI       : http://localhost:8080
+#  PostgreSQL     : localhost:5432  (stocks / stocks123)
 ##############################################################################
 
 services:
@@ -208,8 +210,6 @@ services:
       start_period: 10s
 
   # ── MinIO bucket initialiser (runs once, then exits) ──────────────────────
-  # Creates the 'stocks' bucket and sets a public-read policy so Spark can
-  # write without needing per-request presigned URLs.
   minio-init:
     image: minio/mc:latest
     container_name: stocks-minio-init
@@ -227,12 +227,33 @@ services:
         set -e
         mc alias set local http://minio:9000 \
           "$${MINIO_ACCESS_KEY}" "$${MINIO_SECRET_KEY}"
-
-        # Create the stocks bucket if it doesn't already exist
         mc mb --ignore-existing local/stocks
-
         echo 'Bucket "stocks" is ready.'
     restart: "no"
+
+  # ── PostgreSQL — analytics output store ───────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: stocks-postgres
+    restart: unless-stopped
+    networks:
+      - stocks-net
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-stocks_analytics}
+      POSTGRES_USER:     ${POSTGRES_USER:-stocks}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stocks123}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # init_postgres.sql runs once on first container boot
+      - ./spark/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stocks} -d ${POSTGRES_DB:-stocks_analytics}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   # ── Producer (streams Kaggle → Kafka) ─────────────────────────────────────
   producer:
@@ -340,6 +361,8 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.master.Master
@@ -350,7 +373,13 @@ services:
       MINIO_ENDPOINT:   http://minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
-      MINIO_BUCKET:     stocks
+      MINIO_BUCKET:     ${MINIO_BUCKET:-stocks}
+      # PostgreSQL — consumed by analytics_job.py
+      POSTGRES_HOST:     postgres
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB:-stocks_analytics}
+      POSTGRES_USER:     ${POSTGRES_USER:-stocks}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stocks123}
     volumes:
       - ./spark:/opt/spark/work-dir
 
@@ -371,9 +400,15 @@ services:
       MINIO_ENDPOINT:   http://minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
-      MINIO_BUCKET:     stocks
-      SPARK_WORKER_MEMORY: 4g  
-      SPARK_WORKER_CORES: 4
+      MINIO_BUCKET:     ${MINIO_BUCKET:-stocks}
+      SPARK_WORKER_MEMORY: 4g
+      SPARK_WORKER_CORES:  4
+      # PostgreSQL — consumed by analytics_job.py
+      POSTGRES_HOST:     postgres
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB:-stocks_analytics}
+      POSTGRES_USER:     ${POSTGRES_USER:-stocks}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stocks123}
     volumes:
       - ./spark:/opt/spark/work-dir
 
@@ -383,7 +418,8 @@ volumes:
   kafka-1-data:
   kafka-2-data:
   kafka-3-data:
-  minio-data:       # replaces namenode-data + datanode-data
+  minio-data:
+  postgres-data:        # persists PostgreSQL data across container restarts
 
 # ── Network ────────────────────────────────────────────────────────────────────
 networks:
