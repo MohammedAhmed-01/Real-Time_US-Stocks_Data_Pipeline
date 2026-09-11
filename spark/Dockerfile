@@ -3,7 +3,8 @@
 # Spark 3.5.7 — pre-loaded JARs:
 #   • spark-sql-kafka-0-10        (Kafka source/sink connector)
 #   • spark-token-provider-kafka  (Kafka token provider)
-#   • kafka-clients               (ByteArraySerializer etc. — required runtime dep)
+#   • kafka-clients               (ByteArraySerializer etc.)
+#   • commons-pool2               (REQUIRED by kafka-clients — was missing!)
 #   • hadoop-aws                  (S3A file system for MinIO)
 #   • aws-java-sdk-bundle         (S3A runtime dependency)
 # =============================================================================
@@ -25,10 +26,16 @@ RUN curl -L -o /opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.5.7.jar \
 
 # ---------------------------------------------------------------------------
 # kafka-clients — provides ByteArraySerializer and other Kafka client classes
-# that spark-sql-kafka depends on at runtime but does NOT bundle itself
 # ---------------------------------------------------------------------------
 RUN curl -L -o /opt/spark/jars/kafka-clients-3.4.1.jar \
     https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar
+
+# ---------------------------------------------------------------------------
+# commons-pool2 — REQUIRED by kafka-clients (KafkaDataConsumer uses it)
+# This was the missing JAR causing NoClassDefFoundError
+# ---------------------------------------------------------------------------
+RUN curl -L -o /opt/spark/jars/commons-pool2-2.11.1.jar \
+    https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar
 
 # ---------------------------------------------------------------------------
 # S3A file-system + AWS SDK (required to talk to MinIO)

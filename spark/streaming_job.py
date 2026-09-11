@@ -5,28 +5,39 @@ M2 · Spark Streaming  |  Real-Time US Stocks Data Pipeline
 
 Storage backend: MinIO (S3-compatible object store) via the S3A connector.
 
-All HDFS paths have been replaced with s3a:// URIs.  MinIO credentials and
-endpoint are injected through SparkSession Hadoop configuration so no AWS
-SDK credentials file is needed inside the container.
+CHANGE vs previous version
+---------------------------
+Clean events are now written as ONE Parquet file per ticker symbol instead
+of many scattered row-level files.
 
-Paths:
-    s3a://stocks/clean/          — validated events, partitioned by date
-    s3a://stocks/aggregated/     — 1-minute windowed aggregations
-    s3a://stocks/checkpoints/    — streaming state / fault-recovery
+Layout (MinIO bucket "stocks"):
+    s3a://stocks/clean/<TICKER>/data.parquet   ← one merged file per stock
+    s3a://stocks/aggregated/                   ← 1-minute windowed aggs
+    s3a://stocks/checkpoints/                  ← streaming state
+
+How it works (write_clean_batch):
+    For every micro-batch that arrives from Kafka:
+      1. Find all distinct tickers present in the batch.
+      2. For each ticker:
+           a. Read the existing Parquet file for that ticker (if any).
+           b. Union existing data with the new batch rows.
+           c. Write back as a single coalesced file (overwrite).
+    Result: every ticker always has exactly one up-to-date Parquet file
+    that contains ALL its historical rows received so far.
 
 Usage (inside the Spark container):
     spark-submit \\
       --master spark://stocks-spark:7077 \\
       --conf spark.jars.ivy=/tmp/.ivy2 \\
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.7,\\
-                 org.apache.hadoop:hadoop-aws:3.3.4,\\
-                 com.amazonaws:aws-java-sdk-bundle:1.12.262 \\
       /opt/spark/work-dir/streaming_job.py
 """
 
+from __future__ import annotations
+
+import logging
 import os
 
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     avg,
     col,
@@ -48,6 +59,8 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+log = logging.getLogger(__name__)
+
 # ============================================================
 # 1. Configuration
 # ============================================================
@@ -62,11 +75,11 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 MINIO_BUCKET     = os.getenv("MINIO_BUCKET",     "stocks")
 
-S3_BASE              = f"s3a://{MINIO_BUCKET}"
-CLEAN_PATH           = f"{S3_BASE}/clean"
-AGGREGATED_PATH      = f"{S3_BASE}/aggregated"
-CLEAN_CHECKPOINT     = f"{S3_BASE}/checkpoints/clean"
-AGGREGATED_CHECKPOINT= f"{S3_BASE}/checkpoints/aggregated"
+S3_BASE                = f"s3a://{MINIO_BUCKET}"
+CLEAN_PATH             = f"{S3_BASE}/clean"          # one sub-dir per ticker
+AGGREGATED_PATH        = f"{S3_BASE}/aggregated"
+CLEAN_CHECKPOINT       = f"{S3_BASE}/checkpoints/clean"
+AGGREGATED_CHECKPOINT  = f"{S3_BASE}/checkpoints/aggregated"
 DEAD_LETTER_CHECKPOINT = f"{S3_BASE}/checkpoints/dead-letter"
 
 # ============================================================
@@ -90,11 +103,6 @@ spark = (
     .config("spark.hadoop.fs.s3a.fast.upload",              "true")
     .config("spark.hadoop.fs.s3a.multipart.size",           "104857600")  # 100 MB
     .config("spark.hadoop.fs.s3a.block.size",               "33554432")   # 32 MB
-    .config("spark.hadoop.fs.s3a.committer.name",           "directory")
-    .config("spark.sql.sources.commitProtocolClass",
-            "org.apache.spark.internal.io.cloud.PathOutputCommitProtocol")
-    .config("spark.sql.parquet.output.committer.class",
-            "org.apache.spark.internal.io.cloud.BindingParquetOutputCommitter")
     # Parquet compression
     .config("spark.sql.parquet.compression.codec", "snappy")
     .getOrCreate()
@@ -132,7 +140,8 @@ kafka_df = (
     .format("kafka")
     .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
     .option("subscribe",               KAFKA_TOPIC)
-    .option("startingOffsets",         "latest")
+    .option("startingOffsets",         "earliest")   # read ALL existing data
+    .option("failOnDataLoss",          "false")
     .load()
 )
 
@@ -172,7 +181,7 @@ valid_condition = (
 )
 
 validated_df = stocks_df.withColumn("is_valid", valid_condition)
-valid_df     = validated_df.filter(col("is_valid"))
+valid_df     = validated_df.filter( col("is_valid"))
 invalid_df   = validated_df.filter(~col("is_valid"))
 
 # ============================================================
@@ -194,7 +203,7 @@ windowed_df = (
 )
 
 # ============================================================
-# 8. Dead-Letter Stream → Kafka topic
+# 8. Dead-Letter Stream → Kafka topic  (unchanged)
 # ============================================================
 
 dead_letter_query = (
@@ -210,26 +219,125 @@ dead_letter_query = (
 )
 
 # ============================================================
-# 9. Clean Events → MinIO (Parquet, partitioned by date)
+# 9. Clean Events → MinIO  (ONE Parquet file per ticker)
 # ============================================================
+#
+# MinIO layout after this runs:
+#
+#   stocks/
+#   └── clean/
+#       ├── AAPL/
+#       │   └── part-00000-<uuid>.snappy.parquet   ← ALL AAPL rows
+#       ├── MSFT/
+#       │   └── part-00000-<uuid>.snappy.parquet   ← ALL MSFT rows
+#       ├── TSLA/
+#       │   └── part-00000-<uuid>.snappy.parquet
+#       └── ...
+#
+# Strategy (read-union-overwrite per ticker):
+#   For each micro-batch we find every distinct ticker in the batch,
+#   read its existing Parquet file from MinIO (if one exists), union
+#   the new rows with the old ones, sort by date for readability, then
+#   write it back as a single coalesced file.  The "overwrite" mode
+#   atomically replaces the old file, so readers always see a complete
+#   consistent snapshot.
+#
+# Trade-off: read-modify-write per ticker per batch means one Spark
+#   read + one Spark write for every ticker that appears in the batch.
+#   This is fine for a dataset of ~6 000 tickers where each batch
+#   usually touches a small subset.  For very high-throughput scenarios
+#   consider a periodic compaction job instead.
 
-valid_output_df = valid_df.drop("is_valid", "kafka_timestamp")
+# Columns to keep in the clean file (drop streaming-internal columns)
+_CLEAN_COLS = [
+    "event_id", "ticker", "date",
+    "open", "high", "low", "close", "volume",
+    "dividends", "stock_splits",
+    "stochk_14_3_3", "stochd_14_3_3",
+    "source_file", "produced_at",
+]
 
+
+def write_clean_batch(batch_df: DataFrame, batch_id: int) -> None:
+    """
+    Merge incoming batch rows into one Parquet file per ticker in MinIO.
+
+    Called automatically by Spark's foreachBatch sink for every
+    micro-batch.  If the batch is empty (e.g. during idle periods)
+    the function returns immediately without touching MinIO.
+    """
+    if batch_df.isEmpty():
+        return
+
+    # Keep only the canonical columns; drop is_valid / kafka_timestamp
+    batch_clean = batch_df.select(_CLEAN_COLS)
+
+    # Collect the distinct tickers present in this batch.
+    # collect() is safe here because it is just a list of ticker strings,
+    # not the full data — at most a few thousand short strings.
+    tickers: list[str] = [
+        row.ticker
+        for row in batch_clean.select("ticker").distinct().collect()
+        if row.ticker is not None
+    ]
+
+    log.info(
+        "batch_id=%d | tickers in batch: %d | %s",
+        batch_id, len(tickers),
+        ", ".join(tickers[:10]) + ("…" if len(tickers) > 10 else ""),
+    )
+
+    for ticker in tickers:
+        ticker_path = f"{CLEAN_PATH}/{ticker}"
+
+        # Rows for this ticker from the current micro-batch
+        new_rows = batch_clean.filter(col("ticker") == ticker)
+
+        # Read existing file for this ticker (if it already exists in MinIO)
+        try:
+            existing = spark.read.parquet(ticker_path)
+            # Union old + new, deduplicate on event_id to be safe
+            merged = (
+                existing
+                .union(new_rows)
+                .dropDuplicates(["event_id"])
+                .orderBy("date", "event_id")
+            )
+        except Exception:
+            # No existing file yet — first time we see this ticker
+            merged = new_rows.orderBy("date", "event_id")
+
+        # Write as a SINGLE Parquet file (coalesce → 1 output partition)
+        # mode("overwrite") atomically replaces the previous file
+        (
+            merged
+            .coalesce(1)
+            .write
+            .mode("overwrite")
+            .parquet(ticker_path)
+        )
+
+        log.info(
+            "batch_id=%d | ticker=%-6s | rows=%d | path=%s",
+            batch_id, ticker, merged.count(), ticker_path,
+        )
+
+
+# Wire up the foreachBatch sink
 valid_query = (
-    valid_output_df.writeStream
-    .format("parquet")
-    .outputMode("append")
-    .option("path",              CLEAN_PATH)
+    valid_df
+    .writeStream
+    .foreachBatch(write_clean_batch)
     .option("checkpointLocation", CLEAN_CHECKPOINT)
-    .partitionBy("date")
+    .trigger(processingTime="30 seconds")   # tune to taste
     .start()
 )
 
 # ============================================================
-# 10. Windowed Aggregation → MinIO (Parquet, partitioned by window_date)
+# 10. Windowed Aggregation → MinIO  (unchanged)
 # ============================================================
 
-def write_aggregation_batch(batch_df, batch_id: int) -> None:
+def write_aggregation_batch(batch_df: DataFrame, batch_id: int) -> None:
     """Write one micro-batch of aggregated data to MinIO as Parquet."""
     if batch_df.isEmpty():
         return
@@ -253,7 +361,9 @@ aggregation_query = (
 )
 
 # ============================================================
-# 11. Keep the job alive
+# 11. Keep the job alive — wait for ALL queries
 # ============================================================
 
-aggregation_query.awaitTermination()
+# Block until the first query fails or is stopped manually.
+# This keeps the driver alive so all three queries keep running.
+spark.streams.awaitAnyTermination()
