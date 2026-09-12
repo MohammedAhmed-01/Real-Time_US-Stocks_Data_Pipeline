@@ -6,6 +6,12 @@
 #  MinIO acts as an S3-compatible object store for Parquet data.
 #  PostgreSQL stores SparkSQL analytics output (analytics_job.py).
 #
+#  NOTE (2026-09-12): minio/minio and minio/mc were pulled from Docker Hub
+#  after MinIO stopped publishing free community-edition images. The minio
+#  service now uses elestio/minio (Docker Hub Verified Publisher, tracks
+#  upstream releases) and minio-init uses a pinned minio/mc tag that was
+#  pushed before the cutoff and is still pullable.
+#
 #  MinIO console  : http://localhost:9001   (minioadmin / minioadmin)
 #  MinIO API      : http://localhost:9000
 #  Spark Master   : http://localhost:8081
@@ -187,8 +193,11 @@ services:
     restart: "no"
 
   # ── MinIO — S3-compatible object store (replaces HDFS) ────────────────────
+  # minio/minio was pulled from Docker Hub (MinIO stopped publishing free
+  # community images). elestio/minio is a Docker Hub Verified Publisher
+  # image that stays in sync with upstream MinIO releases.
   minio:
-    image: minio/minio:latest
+    image: elestio/minio:latest
     container_name: stocks-minio
     restart: unless-stopped
     networks:
@@ -199,7 +208,7 @@ services:
     environment:
       MINIO_ROOT_USER:     ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
-    command: server /data --console-address ":9001"
+    command: server --address ":9000" --console-address ":9001" /data
     volumes:
       - minio-data:/data
     healthcheck:
@@ -210,8 +219,15 @@ services:
       start_period: 10s
 
   # ── MinIO bucket initialiser (runs once, then exits) ──────────────────────
+  # Every mc container image we tried has turned out unreliable
+  # (minio/mc removed from Docker Hub; cgr.dev/chainguard/mc needs an org
+  # context; the Docker Hub mirror's -dev tag availability is unconfirmed).
+  # Instead of chasing another registry, this downloads the mc BINARY
+  # directly from dl.min.io — MinIO's own CDN, separate from their Docker
+  # Hub distribution, and still serving binaries as of April 2026 — inside
+  # a plain alpine image, which is one of the most stable images on Docker Hub.
   minio-init:
-    image: minio/mc:latest
+    image: alpine:3.20
     container_name: stocks-minio-init
     networks:
       - stocks-net
@@ -225,6 +241,9 @@ services:
     command:
       - |
         set -e
+        apk add --no-cache curl
+        curl -fL -o /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc
+        chmod +x /usr/local/bin/mc
         mc alias set local http://minio:9000 \
           "$${MINIO_ACCESS_KEY}" "$${MINIO_SECRET_KEY}"
         mc mb --ignore-existing local/stocks
