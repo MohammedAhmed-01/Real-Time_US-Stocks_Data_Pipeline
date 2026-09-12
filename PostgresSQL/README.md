@@ -2,31 +2,21 @@
 
 > **PostgreSQL 16 · Docker · Power BI · pgAdmin · SparkSQL JDBC**
 
-This document covers everything about the PostgreSQL layer of the pipeline: credentials, how to connect, all tables, views, indexes, the bulk loader, and how to query the data from psql, pgAdmin, and Power BI.
-
 ---
 
 ## 📌 Table of Contents
 
 - [Overview](#-overview)
 - [Credentials](#-credentials)
-- [Prerequisites & Installation](#-prerequisites--installation)
-- [Starting PostgreSQL](#-starting-postgresql)
-- [Connecting to PostgreSQL](#-connecting-to-postgresql)
-  - [psql (terminal)](#1-psql-terminal)
-  - [pgAdmin (web UI)](#2-pgadmin-web-ui)
-  - [Power BI](#3-power-bi)
-  - [DBeaver / TablePlus / DataGrip](#4-dbeaver--tableplus--datagrip)
-- [Bulk Loading the Full Kaggle Dataset](#-bulk-loading-the-full-kaggle-dataset)
-  - [Why use the Spark container](#why-use-the-spark-container)
-  - [Step-by-step bulk load commands](#step-by-step-bulk-load-commands)
-  - [Troubleshooting the bulk load](#troubleshooting-the-bulk-load)
+- [Prerequisites](#-prerequisites)
+- [Step 1 — Start PostgreSQL](#step-1--start-postgresql)
+- [Step 2 — Connect to PostgreSQL](#step-2--connect-to-postgresql)
+- [Step 3 — Run the Analytics Job](#step-3--run-the-analytics-job)
+- [Step 4 — Apply Indexes and Views](#step-4--apply-indexes-and-views)
+- [Step 5 — Bulk Load the Full Kaggle Dataset](#step-5--bulk-load-the-full-kaggle-dataset)
+- [Step 6 — Verify Everything](#step-6--verify-everything)
 - [Database Schema](#-database-schema)
-  - [Tables](#tables)
-  - [Views](#views)
-  - [Indexes](#indexes)
 - [Useful Queries](#-useful-queries)
-- [How Data Gets In](#-how-data-gets-in)
 - [Maintenance Commands](#-maintenance-commands)
 - [Troubleshooting](#-troubleshooting)
 
@@ -34,13 +24,13 @@ This document covers everything about the PostgreSQL layer of the pipeline: cred
 
 ## 🔎 Overview
 
-PostgreSQL is the final destination for all analytics computed by `analytics_job.py`. Spark reads Parquet from MinIO, runs SparkSQL queries, and writes results here via JDBC. The database is also populated by `bulk_load_to_postgres.py` which loads the full raw Kaggle dataset directly into a `stocks_raw` table for use in Power BI historical dashboards.
+PostgreSQL is the final destination for all analytics computed by `analytics_job.py`. Spark reads Parquet from MinIO, runs 10 SparkSQL queries, and writes results here via JDBC. A separate bulk loader (`bulk_load_to_postgres.py`) loads the full raw Kaggle dataset into a `stocks_raw` table for Power BI historical dashboards.
 
 ```
 MinIO Parquet
      │
      ▼
-analytics_job.py (Spark)
+analytics_job.py  (Spark)
      │  JDBC  mode=overwrite
      ▼
 PostgreSQL  stocks_analytics
@@ -59,99 +49,80 @@ Power BI / pgAdmin / psql / DBeaver
 
 | Setting | Value |
 |---|---|
-| **Host (from your machine)** | `localhost` |
-| **Host (inside Docker network)** | `postgres` |
-| **Port** | `5432` |
-| **Database** | `stocks_analytics` |
-| **Username** | `stocks` |
-| **Password** | `stocks123` |
-| **JDBC URL** | `jdbc:postgresql://localhost:5432/stocks_analytics` |
-| **Connection string** | `postgresql://stocks:stocks123@localhost:5432/stocks_analytics` |
+| Host (from your machine) | `localhost` |
+| Host (inside Docker network) | `postgres` |
+| Port | `5432` |
+| Database | `stocks_analytics` |
+| Username | `stocks` |
+| Password | `stocks123` |
+| JDBC URL | `jdbc:postgresql://localhost:5432/stocks_analytics` |
 
-> ⚠️ **Important:** When connecting from **inside Docker** (e.g. from the Spark container or pgAdmin), always use `postgres` as the host — not `localhost`. When connecting from your **Windows host machine** (Power BI, DBeaver, psql), use `localhost`.
+> When connecting from **inside Docker** (Spark container, pgAdmin), always use `postgres` as the host. When connecting from your **Windows machine** (Power BI, DBeaver, psql), use `localhost`.
 
 ---
 
-## 🧰 Prerequisites & Installation
-
-### What you need
+## 🧰 Prerequisites
 
 | Requirement | Detail |
 |---|---|
 | Docker Desktop | v24+ with at least **8 GB RAM** allocated |
-| Full stack running | `docker compose up -d` must be healthy |
-| Analytics job ran | `analytics_job.py` must have completed at least once for the 10 analytics tables |
-| (Optional) pgAdmin | Already included in `docker-compose.yml` |
-| (Optional) Npgsql driver | Required for Power BI on Windows — see Power BI section |
-
-### Install pgAdmin (already in docker-compose.yml)
-
-pgAdmin is already defined in `docker-compose.yml`. It starts automatically with `docker compose up -d`. Open **http://localhost:5050** after startup.
+| Full stack running | `docker compose up -d` must show all services healthy |
+| Analytics job ran | `analytics_job.py` must have completed at least once |
+| StockHistory CSVs | Kaggle dataset copied into the Spark container at `/tmp/StockHistory` |
 
 ---
 
-## 🚀 Starting PostgreSQL
+## Step 1 — Start PostgreSQL
 
-PostgreSQL starts automatically as part of the full stack:
+PostgreSQL starts automatically with the full stack. Run this from your project root:
 
 ```powershell
-# Start everything
 docker compose up -d
+```
 
-# Check postgres is healthy
+Confirm it is healthy:
+
+```powershell
 docker compose ps
+```
 
-# View postgres logs
+You should see `stocks-postgres` with status `healthy`. If not, check logs:
+
+```powershell
 docker compose logs postgres
-
-# Stop everything
-docker compose down
-
-# Stop and delete all data (full reset)
-docker compose down -v
 ```
 
 ---
 
-## 🔌 Connecting to PostgreSQL
+## Step 2 — Connect to PostgreSQL
 
-### 1. psql (terminal)
+### Option A — psql in the terminal (no install needed)
 
 ```powershell
-# Connect directly via Docker (no local psql install needed)
 docker exec -it stocks-postgres psql -U stocks -d stocks_analytics
 ```
 
-Once inside psql:
+Useful psql commands once connected:
 
 ```sql
--- List all tables
-\dt
-
--- List all views
-\dv
-
--- Describe a table's columns
-\d stock_summary
-
--- Toggle expanded vertical display (great for wide rows)
-\x
-
--- Exit
-\q
+\dt          -- list all tables
+\dv          -- list all views
+\d stocks_raw  -- describe a table
+\x           -- toggle expanded display (good for wide rows)
+\q           -- exit
 ```
 
-### 2. pgAdmin (web UI)
+### Option B — pgAdmin (browser UI)
 
 1. Open **http://localhost:5050**
 2. Login: `admin@stocks.com` / `admin123`
 3. Right-click **Servers** → **Register** → **Server**
-4. Fill in the **General** tab — Name: `US Stocks Pipeline`
-5. Fill in the **Connection** tab:
+4. **General** tab → Name: `US Stocks Pipeline`
+5. **Connection** tab:
 
 | Field | Value |
 |---|---|
-| Host name / address | `postgres` ← use this inside Docker, NOT `localhost` |
+| Host name / address | `postgres` ← use this, NOT `localhost` |
 | Port | `5432` |
 | Maintenance database | `stocks_analytics` |
 | Username | `stocks` |
@@ -160,69 +131,17 @@ Once inside psql:
 
 6. Click **Save**
 
-> ⚠️ Always use `postgres` as the host in pgAdmin — it connects via the internal `stocks-net` Docker network, not your Windows host. Using `localhost` will fail.
+### Option C — Power BI
 
-### 3. Power BI
+1. Install the Npgsql driver from https://github.com/npgsql/npgsql/releases → download the `.msi` → install → **restart your PC**
+2. Open Power BI Desktop → **Home** → **Get Data** → **More** → search **PostgreSQL** → **Connect**
+3. Server: `localhost:5432` — Database: `stocks_analytics` → **OK**
+4. Authentication tab → Username: `stocks` → Password: `stocks123` → **Connect**
+5. Select the tables and views you want and click **Load**
 
-**Step 1 — Install the Npgsql driver (required — do this before opening Power BI)**
+> Use `localhost` in Power BI (not `postgres`) — Power BI runs on your Windows machine, not inside Docker.
 
-1. Go to https://github.com/npgsql/npgsql/releases
-2. Download the latest `Npgsql-x.x.x.msi`
-3. Run the installer
-4. **Restart your PC** (required — Power BI won't see the driver without a restart)
-5. Open Power BI Desktop
-
-**Step 2 — Connect Power BI to PostgreSQL**
-
-1. Click **Home** → **Get Data** → **More…**
-2. Search **PostgreSQL** → click **Connect**
-3. Enter connection details:
-
-| Field | Value |
-|---|---|
-| Server | `localhost:5432` |
-| Database | `stocks_analytics` |
-
-4. Click **OK**
-5. When prompted, select the **Database** tab and enter:
-
-| Field | Value |
-|---|---|
-| User name | `stocks` |
-| Password | `stocks123` |
-
-6. Click **Connect**
-7. In the Navigator, select the tables and views you want — recommended selection:
-
-```
-✅ stock_summary
-✅ price_volatility
-✅ monthly_performance
-✅ yearly_performance
-✅ top_performers
-✅ volume_leaders
-✅ dividend_analysis
-✅ stochastic_signals
-✅ daily_market_breadth
-✅ streaming_window_summary
-✅ stocks_raw              ← full historical data from bulk loader
-✅ v_top_gainers
-✅ v_top_losers
-✅ v_high_volatility
-✅ v_most_traded
-✅ v_dividend_champions
-✅ v_overbought_stocks
-✅ v_market_trend
-✅ v_full_stock_profile
-```
-
-8. Click **Load** or **Transform Data**
-
-> **Power BI tip:** Use `localhost` (not `postgres`) — Power BI runs on your Windows machine, not inside Docker.
-
-### 4. DBeaver / TablePlus / DataGrip
-
-Use these connection settings in any SQL client:
+### Option D — DBeaver / DataGrip / TablePlus
 
 | Field | Value |
 |---|---|
@@ -235,171 +154,228 @@ Use these connection settings in any SQL client:
 
 ---
 
-## 📦 Bulk Loading the Full Kaggle Dataset
+## Step 3 — Run the Analytics Job
 
-`bulk_load_to_postgres.py` loads every `<TICKER>.csv` from the downloaded Kaggle dataset directly into a `stocks_raw` table in PostgreSQL. This table is separate from the 10 analytics tables written by Spark — it gives Power BI access to the full raw historical data without going through the streaming pipeline.
+This reads Parquet from MinIO, runs 10 SparkSQL queries, and writes results to PostgreSQL. Run the streaming job first (Step 5 of the main quickstart) so MinIO has data, then:
 
-### Why use the Spark container
+```powershell
+docker exec -it stocks-spark `
+  /opt/spark/bin/spark-submit `
+    --master local[4] `
+    --conf spark.jars.ivy=/tmp/.ivy2 `
+    --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem `
+    --conf "spark.hadoop.fs.s3a.endpoint=http://minio:9000" `
+    --conf spark.hadoop.fs.s3a.path.style.access=true `
+    --conf spark.hadoop.fs.s3a.access.key=minioadmin `
+    --conf spark.hadoop.fs.s3a.secret.key=minioadmin `
+    --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false `
+    /opt/spark/work-dir/analytics_job.py
+```
 
-Connecting to PostgreSQL directly from your Windows host via `127.0.0.1:5432` can fail due to Docker's port proxy caching auth state incorrectly. The most reliable approach is to run the bulk loader **from inside the Spark container**, which connects to PostgreSQL via the internal `stocks-net` Docker network (`host=postgres`) — bypassing the Windows host networking layer entirely.
+Expected output when successful:
 
-The Spark container already has Python available, and we install the required libraries into a writable `/tmp/pylibs` directory to avoid permission issues.
+```
+✓  Stock Summary                  → table=stock_summary                rows=...
+✓  Price Volatility               → table=price_volatility             rows=...
+✓  Monthly Performance            → table=monthly_performance          rows=...
+✓  Yearly Performance             → table=yearly_performance           rows=...
+✓  Top Performers                 → table=top_performers               rows=...
+✓  Volume Leaders                 → table=volume_leaders               rows=...
+✓  Dividend Analysis              → table=dividend_analysis            rows=...
+✓  Stochastic Signals             → table=stochastic_signals           rows=...
+✓  Daily Market Breadth           → table=daily_market_breadth         rows=...
+✓  Streaming Window Summary       → table=streaming_window_summary     rows=...
+Analytics complete in ~40s
+```
 
-### Step-by-step bulk load commands
+---
 
-Run all of these in PowerShell in order:
+## Step 4 — Apply Indexes and Views
 
-**Step 1 — Install Python dependencies inside the Spark container**
+Spark's `mode=overwrite` drops and recreates tables without indexes or views. Run this after every analytics job to restore them:
+
+```powershell
+docker cp spark/post_analytics.sql stocks-postgres:/tmp/post_analytics.sql
+```
+
+```powershell
+docker exec -i stocks-postgres psql -U stocks -d stocks_analytics `
+  -f /tmp/post_analytics.sql
+```
+
+Expected output:
+
+```
+=== Creating indexes ===
+=== Creating views ===
+=== post_analytics.sql complete ===
+```
+
+---
+
+## Step 5 — Bulk Load the Full Kaggle Dataset
+
+This loads every `<TICKER>.csv` from the Kaggle dataset directly into a `stocks_raw` table. This gives Power BI access to the full raw historical data independently of the streaming pipeline.
+
+> **Important:** The bulk loader script (`PostgresSQL/bulk_load_to_postgres.py`) has been updated to fix two bugs from the original version:
+> - **Timezone-aware dates** like `1980-12-12 00:00:00-05:00` now parse correctly (`.dt.tz_localize(None).dt.date` instead of `.dt.date`)
+> - **`COPY FROM` replaced with `execute_values`** — handles special characters, NaN, and extra CSV columns (RSI, MACD, BB, etc.) without crashing
+
+### 5a — Install Python dependencies inside the Spark container
+
+Only needed once per container lifetime:
 
 ```powershell
 docker exec -it stocks-spark bash -c "pip3 install --target=/tmp/pylibs psycopg2-binary pandas tqdm"
 ```
 
-This installs `psycopg2-binary`, `pandas`, and `tqdm` into `/tmp/pylibs` inside the container — no root or sudo needed. The `--target` flag writes to a writable directory.
-
-Expected output: several `Downloading ...` lines followed by `Successfully installed ...`
-
-**Step 2 — Copy the bulk loader script into the Spark container**
+### 5b — Copy the bulk loader script into the container
 
 ```powershell
-docker cp PostgresSQL\bulk_load_to_postgres.py stocks-spark:/tmp/bulk_load_to_postgres.py
+docker cp "PostgresSQL\bulk_load_to_postgres.py" stocks-spark:/tmp/bulk_load_to_postgres.py
 ```
 
-This copies the script from your Windows machine into the container's `/tmp/` directory.
-
-**Step 3 — Copy the Kaggle stock data into the Spark container**
+### 5c — Copy the Kaggle stock CSV files into the container
 
 ```powershell
 docker cp "C:\Users\moham\Desktop\ETA_FinalProject\Data\archive\Data\StockHistory" stocks-spark:/tmp/StockHistory
 ```
 
-> ⏳ This copies 6,000+ CSV files and will take several minutes. You will see no progress bar — wait for the PowerShell prompt to return.
+> This copies 6,000+ CSV files and will take several minutes with no progress bar — wait for the PowerShell prompt to return.
 
-**Step 4 — Verify the data was copied**
-
-```powershell
-docker exec -it stocks-spark bash -c "ls /tmp/StockHistory | head -20 && echo '---' && ls /tmp/StockHistory | wc -l"
-```
-
-You should see ticker filenames like `AAPL.csv`, `MSFT.csv` and a total file count matching your local folder.
-
-**Step 5 — Run the bulk loader**
+### 5d — Verify the files were copied
 
 ```powershell
-docker exec -it stocks-spark bash -c "PYTHONPATH=/tmp/pylibs python3 /tmp/bulk_load_to_postgres.py --data-dir /tmp/StockHistory --host postgres --port 5432 --db stocks_analytics --user stocks --password stocks123 --workers 4 --chunk 100000"
+docker exec -it stocks-spark bash -c "ls /tmp/StockHistory | head -10 && echo '---' && ls /tmp/StockHistory | wc -l"
 ```
 
-Key flags explained:
+You should see ticker filenames like `AAPL.csv`, `MSFT.csv` and a total count matching your local folder.
+
+### 5e — Test on a single ticker first
+
+Before running the full load, confirm the script works on one ticker:
+
+```powershell
+docker exec -it stocks-spark bash -c "PYTHONPATH=/tmp/pylibs python3 /tmp/bulk_load_to_postgres.py --data-dir /tmp/StockHistory --host postgres --port 5432 --db stocks_analytics --user stocks --password stocks123 --ticker AAPL --verbose"
+```
+
+Expected output (0 errors):
+
+```
+PostgreSQL connection OK.
+Files to load : 1
+Table 'stocks_raw' is ready.
+Loading: 100% | 1/1 [errs=0, rows=11388]
+BULK LOAD COMPLETE
+  Files with errors: 0
+  Rows inserted    : 11388
+```
+
+### 5f — Run the full bulk load
+
+```powershell
+docker exec -it stocks-spark bash -c "PYTHONPATH=/tmp/pylibs python3 /tmp/bulk_load_to_postgres.py --data-dir /tmp/StockHistory --host postgres --port 5432 --db stocks_analytics --user stocks --password stocks123 --workers 4 --chunk 50000 --drop"
+```
+
+Flag reference:
 
 | Flag | Value | Meaning |
 |---|---|---|
-| `--data-dir` | `/tmp/StockHistory` | Path to the CSV files inside the container |
-| `--host` | `postgres` | Internal Docker network hostname — NOT `localhost` |
-| `--port` | `5432` | PostgreSQL port |
-| `--db` | `stocks_analytics` | Target database |
-| `--user` | `stocks` | Database username |
-| `--password` | `stocks123` | Database password |
-| `--workers` | `4` | Parallel file loaders (raise to 8 on machines with more RAM) |
-| `--chunk` | `100000` | Rows per COPY batch (raise to 500000 if you have lots of RAM) |
+| `--data-dir` | `/tmp/StockHistory` | Path to CSV files inside the container |
+| `--host` | `postgres` | Internal Docker hostname — NOT `localhost` |
+| `--workers` | `4` | Parallel file loaders |
+| `--chunk` | `50000` | Rows per INSERT batch |
+| `--drop` | — | Drop and recreate `stocks_raw` before loading (safe re-run) |
 
-Expected output:
+### 5g — Re-running the bulk loader
 
-```
-[BULK-LOAD] INFO  PostgreSQL connection OK.
-[BULK-LOAD] INFO  Table 'stocks_raw' is ready.
-Loading: 100%|████████████████| 6227/6227 [file]
-[BULK-LOAD] INFO  Creating indexes on 'stocks_raw' ...
-[BULK-LOAD] INFO  Indexes created.
-[BULK-LOAD] INFO  ============================================================
-[BULK-LOAD] INFO  BULK LOAD COMPLETE
-[BULK-LOAD] INFO  Files processed : 6227
-[BULK-LOAD] INFO  Files skipped   : ...
-[BULK-LOAD] INFO  Rows inserted   : ...
-[BULK-LOAD] INFO  Rows in DB now  : ...
-[BULK-LOAD] INFO  Wall time       : ... s
-```
-
-**Step 6 — Verify the data is in PostgreSQL**
+The loader is always safe to re-run. Use `--drop` to start fresh, or omit it to append (duplicates are skipped via `ON CONFLICT DO NOTHING`):
 
 ```powershell
-docker exec -it stocks-postgres psql -U stocks -d stocks_analytics -c "SELECT COUNT(*) FROM stocks_raw;"
+docker exec -it stocks-spark bash -c "PYTHONPATH=/tmp/pylibs python3 /tmp/bulk_load_to_postgres.py --data-dir /tmp/StockHistory --host postgres --port 5432 --db stocks_analytics --user stocks --password stocks123 --workers 4 --chunk 50000 --drop"
+```
+
+---
+
+## Step 6 — Verify Everything
+
+### Check all table row counts
+
+```powershell
+docker exec -it stocks-postgres psql -U stocks -d stocks_analytics -c "
+SELECT 'stock_summary'             AS tbl, COUNT(*) AS rows FROM stock_summary       UNION ALL
+SELECT 'price_volatility',                  COUNT(*) FROM price_volatility            UNION ALL
+SELECT 'monthly_performance',               COUNT(*) FROM monthly_performance         UNION ALL
+SELECT 'yearly_performance',               COUNT(*) FROM yearly_performance           UNION ALL
+SELECT 'top_performers',                    COUNT(*) FROM top_performers              UNION ALL
+SELECT 'volume_leaders',                    COUNT(*) FROM volume_leaders              UNION ALL
+SELECT 'dividend_analysis',                 COUNT(*) FROM dividend_analysis           UNION ALL
+SELECT 'stochastic_signals',                COUNT(*) FROM stochastic_signals          UNION ALL
+SELECT 'daily_market_breadth',              COUNT(*) FROM daily_market_breadth        UNION ALL
+SELECT 'streaming_window_summary',          COUNT(*) FROM streaming_window_summary    UNION ALL
+SELECT 'stocks_raw',                        COUNT(*) FROM stocks_raw;
+"
+```
+
+### Check the raw data loaded correctly
+
+```powershell
 docker exec -it stocks-postgres psql -U stocks -d stocks_analytics -c "SELECT ticker, COUNT(*) AS rows FROM stocks_raw GROUP BY ticker ORDER BY rows DESC LIMIT 10;"
+```
+
+```powershell
 docker exec -it stocks-postgres psql -U stocks -d stocks_analytics -c "SELECT * FROM stocks_raw WHERE ticker='AAPL' ORDER BY date LIMIT 5;"
 ```
 
-**Step 7 — Re-run the bulk loader (safe to repeat)**
-
-The bulk loader uses `CREATE TABLE IF NOT EXISTS` — it will append to existing data. If you want a clean reload, add `--drop`:
+### Check top performers
 
 ```powershell
-docker exec -it stocks-spark bash -c "PYTHONPATH=/tmp/pylibs python3 /tmp/bulk_load_to_postgres.py --data-dir /tmp/StockHistory --host postgres --port 5432 --db stocks_analytics --user stocks --password stocks123 --workers 4 --chunk 100000 --drop"
+docker exec -it stocks-postgres psql -U stocks -d stocks_analytics -c "SELECT ticker, pct_change, direction FROM top_performers ORDER BY pct_change DESC LIMIT 10;"
 ```
-
-The `--drop` flag drops and recreates `stocks_raw` before loading — use this if you want to avoid duplicate rows from a previous run.
-
-**Load a single ticker for testing:**
-
-```powershell
-docker exec -it stocks-spark bash -c "PYTHONPATH=/tmp/pylibs python3 /tmp/bulk_load_to_postgres.py --data-dir /tmp/StockHistory --host postgres --port 5432 --db stocks_analytics --user stocks --password stocks123 --ticker AAPL"
-```
-
-### Troubleshooting the bulk load
-
-| Problem | Fix |
-|---|---|
-| `pip3 install` fails with permission error | Use `--target=/tmp/pylibs` as shown above — avoids system permission issues |
-| `docker cp` of StockHistory takes very long | Normal — 6000+ files takes several minutes; wait for the PowerShell prompt |
-| `Cannot connect to PostgreSQL` from host | Use `--host postgres` (internal Docker name), not `127.0.0.1` |
-| `password authentication failed` from host | Known Docker proxy issue — always connect via the Spark container as shown above |
-| `No CSV files found` | Check `--data-dir` path; verify with `docker exec -it stocks-spark bash -c "ls /tmp/StockHistory | head"` |
-| Files skipped with "missing required columns" | Normal for warrant/unit variants that have different CSV structures |
-| Rows duplicated on re-run | Add `--drop` flag to start fresh |
 
 ---
 
 ## 🗂 Database Schema
 
-### Tables
+### Analytics tables (written by `analytics_job.py`)
 
-#### Pipeline analytics tables (written by `analytics_job.py`)
+| Table | Description | Key Columns |
+|---|---|---|
+| `stock_summary` | Overall per-ticker stats | `ticker`, `trading_days`, `avg_close`, `total_volume` |
+| `price_volatility` | Risk and spread metrics | `ticker`, `coeff_variation_pct`, `all_time_high`, `win_rate_pct` |
+| `monthly_performance` | Monthly OHLCV per ticker | `ticker`, `year`, `month`, `month_return_pct` |
+| `yearly_performance` | Annual OHLCV per ticker | `ticker`, `year`, `year_return_pct` |
+| `top_performers` | All-time % price change | `ticker`, `pct_change`, `direction` |
+| `volume_leaders` | Most traded stocks | `ticker`, `total_volume`, `high_volume_days` |
+| `dividend_analysis` | Income / dividend stocks | `ticker`, `total_dividends_paid`, `approx_dividend_yield_pct` |
+| `stochastic_signals` | Overbought / oversold counts | `ticker`, `overbought_k`, `oversold_rate_pct` |
+| `daily_market_breadth` | Market-wide daily snapshot | `date`, `advancing_stocks`, `advance_decline_pct` |
+| `streaming_window_summary` | 1-minute window aggregations | `ticker`, `window_start`, `avg_close` |
 
-| Table | Description |
-|---|---|
-| `stock_summary` | Overall per-ticker stats |
-| `price_volatility` | Risk and spread metrics |
-| `monthly_performance` | Monthly OHLCV per ticker |
-| `yearly_performance` | Annual OHLCV per ticker |
-| `top_performers` | All-time % price change |
-| `volume_leaders` | Most traded stocks |
-| `dividend_analysis` | Income / dividend stocks |
-| `stochastic_signals` | Overbought / oversold counts |
-| `daily_market_breadth` | Market-wide daily snapshot |
-| `streaming_window_summary` | 1-minute window aggregations |
-
-#### Raw historical table (written by `bulk_load_to_postgres.py`)
+### Raw table (written by `bulk_load_to_postgres.py`)
 
 **`stocks_raw`** — Full Kaggle dataset, one row per ticker per trading day
 
-| Column | Type | Description |
+| Column | Type | Notes |
 |---|---|---|
 | `id` | bigserial | Auto-incrementing primary key |
-| `ticker` | text | Stock ticker symbol (e.g. `AAPL`) |
-| `date` | date | Trading date |
+| `ticker` | text | e.g. `AAPL` |
+| `date` | date | Trading date (timezone stripped on load) |
 | `open` | double precision | Opening price |
 | `high` | double precision | Session high |
 | `low` | double precision | Session low |
 | `close` | double precision | Closing price |
 | `volume` | double precision | Shares traded |
-| `dividends` | double precision | Dividend amount (0.0 on non-event days) |
-| `stock_splits` | double precision | Split ratio (0.0 on non-event days) |
-| `stochk_14_3_3` | double precision | Stochastic %K (null during warm-up) |
-| `stochd_14_3_3` | double precision | Stochastic %D (null during warm-up) |
+| `dividends` | double precision | 0.0 on non-event days |
+| `stock_splits` | double precision | 0.0 on non-event days |
+| `stochk_14_3_3` | double precision | Nullable during indicator warm-up |
+| `stochd_14_3_3` | double precision | Nullable during indicator warm-up |
 | `source_file` | text | Original CSV filename |
 | `loaded_at` | timestamptz | When this row was loaded |
 
-### Views
+> Extra CSV columns (RSI_14, MACD, BBL, WILLR, OBV, AD, etc.) are present in the Kaggle CSVs but are intentionally ignored by the bulk loader — only the canonical columns above are stored.
 
-Views are created by `post_analytics.sql` after each analytics run.
+### Views (created by `post_analytics.sql`)
 
 | View | Description |
 |---|---|
@@ -412,116 +388,79 @@ Views are created by `post_analytics.sql` after each analytics run.
 | `v_market_trend` | 30-day rolling advance/decline ratio |
 | `v_full_stock_profile` | Combined single-row summary per ticker |
 
-### Indexes
-
-All indexes are created by `post_analytics.sql`. They are dropped and recreated on each analytics run because Spark JDBC `mode=overwrite` drops the table and its indexes before writing.
-
-The `stocks_raw` table has its own permanent indexes created by the bulk loader:
-
-| Index | Table | Column(s) |
-|---|---|---|
-| `stocks_raw_ticker_idx` | `stocks_raw` | `ticker` |
-| `stocks_raw_date_idx` | `stocks_raw` | `date DESC` |
-| `stocks_raw_ticker_date` | `stocks_raw` | `ticker, date` |
-| `stocks_raw_close_idx` | `stocks_raw` | `close` |
-
 ---
 
 ## 💡 Useful Queries
 
 ```sql
--- ── Top 10 all-time gainers ──────────────────────────────────────────────────
+-- Top 10 all-time gainers
 SELECT ticker, first_close, last_close, pct_change, direction
 FROM top_performers
 ORDER BY pct_change DESC
 LIMIT 10;
 
--- ── Top 10 all-time losers ───────────────────────────────────────────────────
+-- Top 10 all-time losers
 SELECT ticker, first_close, last_close, pct_change
 FROM top_performers
 ORDER BY pct_change ASC
 LIMIT 10;
 
--- ── Most volatile stocks ─────────────────────────────────────────────────────
+-- Most volatile stocks
 SELECT ticker, coeff_variation_pct, all_time_high, all_time_low, win_rate_pct
 FROM price_volatility
 ORDER BY coeff_variation_pct DESC
 LIMIT 10;
 
--- ── Highest volume stocks ────────────────────────────────────────────────────
+-- Highest volume stocks
 SELECT ticker, total_volume, avg_daily_volume, high_volume_days
 FROM volume_leaders
 ORDER BY total_volume DESC
 LIMIT 10;
 
--- ── Best dividend payers ─────────────────────────────────────────────────────
+-- Best dividend payers
 SELECT ticker, total_dividends_paid, num_dividend_events, approx_dividend_yield_pct
 FROM dividend_analysis
 ORDER BY total_dividends_paid DESC
 LIMIT 10;
 
--- ── Market trend over time ───────────────────────────────────────────────────
+-- Market trend over time (last 30 days)
 SELECT date, active_stocks, advancing_stocks, declining_stocks, advance_decline_pct
 FROM daily_market_breadth
 ORDER BY date DESC
 LIMIT 30;
 
--- ── Full profile for a specific ticker ───────────────────────────────────────
+-- Full profile for one ticker
 SELECT * FROM v_full_stock_profile WHERE ticker = 'AAPL';
 
--- ── Monthly return for a ticker ──────────────────────────────────────────────
+-- Monthly returns for one ticker
 SELECT year, month, month_open, month_close, month_return_pct
 FROM monthly_performance
 WHERE ticker = 'AAPL'
 ORDER BY year, month;
 
--- ── Raw historical data for a ticker (from bulk loader) ──────────────────────
+-- Raw historical data for one ticker
 SELECT date, open, high, low, close, volume
 FROM stocks_raw
 WHERE ticker = 'AAPL'
 ORDER BY date DESC
 LIMIT 20;
 
--- ── All tickers in stocks_raw ────────────────────────────────────────────────
+-- All distinct tickers in stocks_raw
 SELECT DISTINCT ticker FROM stocks_raw ORDER BY ticker;
 
--- ── Row counts for all tables ────────────────────────────────────────────────
-SELECT 'stock_summary'              AS tbl, COUNT(*) AS rows FROM stock_summary       UNION ALL
-SELECT 'price_volatility',                  COUNT(*) FROM price_volatility             UNION ALL
-SELECT 'monthly_performance',               COUNT(*) FROM monthly_performance          UNION ALL
-SELECT 'yearly_performance',                COUNT(*) FROM yearly_performance           UNION ALL
-SELECT 'top_performers',                    COUNT(*) FROM top_performers               UNION ALL
-SELECT 'volume_leaders',                    COUNT(*) FROM volume_leaders               UNION ALL
-SELECT 'dividend_analysis',                 COUNT(*) FROM dividend_analysis            UNION ALL
-SELECT 'stochastic_signals',                COUNT(*) FROM stochastic_signals           UNION ALL
-SELECT 'daily_market_breadth',              COUNT(*) FROM daily_market_breadth         UNION ALL
-SELECT 'streaming_window_summary',          COUNT(*) FROM streaming_window_summary     UNION ALL
-SELECT 'stocks_raw',                        COUNT(*) FROM stocks_raw;
+-- Row counts for all tables
+SELECT 'stock_summary'            AS tbl, COUNT(*) AS rows FROM stock_summary       UNION ALL
+SELECT 'price_volatility',                COUNT(*) FROM price_volatility             UNION ALL
+SELECT 'monthly_performance',             COUNT(*) FROM monthly_performance          UNION ALL
+SELECT 'yearly_performance',              COUNT(*) FROM yearly_performance           UNION ALL
+SELECT 'top_performers',                  COUNT(*) FROM top_performers               UNION ALL
+SELECT 'volume_leaders',                  COUNT(*) FROM volume_leaders               UNION ALL
+SELECT 'dividend_analysis',               COUNT(*) FROM dividend_analysis            UNION ALL
+SELECT 'stochastic_signals',              COUNT(*) FROM stochastic_signals           UNION ALL
+SELECT 'daily_market_breadth',            COUNT(*) FROM daily_market_breadth         UNION ALL
+SELECT 'streaming_window_summary',        COUNT(*) FROM streaming_window_summary     UNION ALL
+SELECT 'stocks_raw',                      COUNT(*) FROM stocks_raw;
 ```
-
----
-
-## ⚙️ How Data Gets In
-
-### Via Spark analytics job (`analytics_job.py`)
-
-```python
-spark.sql(query)
-  .write
-  .format("jdbc")
-  .option("url", "jdbc:postgresql://postgres:5432/stocks_analytics")
-  .option("user", "stocks")
-  .option("password", "stocks123")
-  .option("driver", "org.postgresql.Driver")
-  .mode("overwrite")   # drops and recreates each table
-  .save()
-```
-
-`mode=overwrite` means each analytics run **replaces all data** in the 10 analytics tables. Run `post_analytics.sql` after every analytics job to restore indexes and views.
-
-### Via bulk loader (`bulk_load_to_postgres.py`)
-
-Uses PostgreSQL `COPY` via `psycopg2` — the fastest possible bulk insert method. Reads CSVs in parallel across multiple workers and streams rows directly into PostgreSQL without buffering the entire file in memory. The `stocks_raw` table is independent of the Spark pipeline tables and is safe to run at any time.
 
 ---
 
@@ -531,7 +470,7 @@ Uses PostgreSQL `COPY` via `psycopg2` — the fastest possible bulk insert metho
 # Connect to psql
 docker exec -it stocks-postgres psql -U stocks -d stocks_analytics
 
-# Copy and run post_analytics.sql (restores indexes + views after analytics job)
+# Re-apply indexes and views after analytics job
 docker cp spark/post_analytics.sql stocks-postgres:/tmp/post_analytics.sql
 docker exec -i stocks-postgres psql -U stocks -d stocks_analytics `
   -f /tmp/post_analytics.sql
@@ -554,13 +493,11 @@ docker exec -it stocks-postgres psql -U stocks -d stocks_analytics -c "
   WHERE schemaname = 'public'
   ORDER BY pg_total_relation_size(tablename::text) DESC;"
 
-# Check active connections
-docker exec -it stocks-postgres psql -U stocks -d stocks_analytics `
-  -c "SELECT pid, usename, application_name, state FROM pg_stat_activity WHERE datname = 'stocks_analytics';"
+# Stop everything (keeps data)
+docker compose down
 
-# Full reset (delete all data)
+# Full reset — deletes all data
 docker compose down -v
-docker compose up -d
 ```
 
 ---
@@ -570,15 +507,15 @@ docker compose up -d
 | Problem | Fix |
 |---|---|
 | `Connection refused` on port 5432 | Run `docker compose ps` — postgres must show `healthy`. If not: `docker compose up -d postgres` |
-| `password authentication failed` from Windows host | Known Docker proxy issue — run the bulk loader from inside the Spark container using `--host postgres` as documented above |
-| `password authentication failed` even after ALTER USER | Run: `docker exec -it stocks-postgres psql -U stocks -d postgres -c "SET password_encryption='md5'; ALTER USER stocks WITH ENCRYPTED PASSWORD 'stocks123';"` then `docker compose restart postgres` |
-| Tables missing / empty | Run `analytics_job.py` first — PostgreSQL starts empty; Spark populates it |
-| `stocks_raw` missing | Run the bulk loader steps documented in this README |
-| Views missing after analytics run | Run `post_analytics.sql` — Spark's `mode=overwrite` drops tables and their dependent views |
-| Power BI can't connect | Install Npgsql `.msi` driver and **restart your PC** before opening Power BI. Use `localhost` not `postgres` as the server |
-| pgAdmin can't reach postgres | Use host `postgres` (not `localhost`) in the pgAdmin server registration |
-| `stocks_analytics` database not found | Database is created on first boot via `init_postgres.sql` — check: `docker compose logs postgres` |
-| Slow queries | Re-run `post_analytics.sql` to restore indexes — Spark drops them on every overwrite |
-| Bulk loader: `No CSV files found` | Verify the `--data-dir` path matches where you copied the data inside the container |
-| Bulk loader: duplicate rows | Add `--drop` flag to drop and recreate `stocks_raw` before loading |
-| `pip3 install` permission denied in Spark container | Always use `--target=/tmp/pylibs` and set `PYTHONPATH=/tmp/pylibs` when running the script |
+| `password authentication failed` from Windows host | Always connect via the Spark container using `--host postgres`, not `127.0.0.1` |
+| Tables missing or empty | Run Step 3 (analytics job) — PostgreSQL starts completely empty |
+| `stocks_raw` table missing | Run Step 5 (bulk loader) |
+| Views missing after analytics run | Run Step 4 (`post_analytics.sql`) — Spark's `mode=overwrite` drops views on every run |
+| Bulk loader: `AttributeError: Can only use .dt accessor with datetimelike values` | You are using the old `bulk_load_to_postgres.py`. Replace it with the updated version — the fix is parsing dates with `utc=True` then calling `.dt.tz_localize(None).dt.date` |
+| Bulk loader: high error count (~2300/6200) | Same root cause as above — old script used `COPY FROM` which chokes on timezone strings. Replace with the updated script |
+| Bulk loader: `No CSV files found` | Check `--data-dir` path: `docker exec -it stocks-spark bash -c "ls /tmp/StockHistory | head"` |
+| Bulk loader: duplicate rows on re-run | Add `--drop` flag — the table has a `UNIQUE (ticker, date)` constraint so duplicates are skipped automatically without `--drop` |
+| Power BI can't connect | Install Npgsql `.msi` and **restart your PC** before opening Power BI. Use `localhost` not `postgres` as the server |
+| pgAdmin can't reach postgres | Use host `postgres` (not `localhost`) in the pgAdmin server registration — they communicate via the internal `stocks-net` Docker network |
+| Port 5432 already in use | Stop the conflicting service or change the host-side port in `docker-compose.yml` |
+| Slow queries after analytics run | Re-run Step 4 (`post_analytics.sql`) to restore indexes |
