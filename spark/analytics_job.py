@@ -3,46 +3,40 @@ analytics_job.py — SparkSQL Analytics: MinIO Parquet → PostgreSQL
 =================================================================
 M3 · Analytics  |  Real-Time US Stocks Data Pipeline
 
-Reads clean Parquet and aggregated Parquet from MinIO, runs nine
-SparkSQL insight queries, and writes each result table to PostgreSQL.
-
 Run inside the Spark container:
     spark-submit \\
-      --master spark://stocks-spark:7077 \\
+      --master local[4] \\
       --conf spark.jars.ivy=/tmp/.ivy2 \\
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \\
+      --conf "spark.hadoop.fs.s3a.endpoint=http://minio:9000" \\
+      --conf spark.hadoop.fs.s3a.path.style.access=true \\
+      --conf spark.hadoop.fs.s3a.access.key=minioadmin \\
+      --conf spark.hadoop.fs.s3a.secret.key=minioadmin \\
+      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \\
+      --conf spark.sql.files.ignoreMissingFiles=true \\
       /opt/spark/work-dir/analytics_job.py
 
-Tables written to PostgreSQL (stocks_analytics):
-  1.  stock_summary          — overall per-ticker stats
-  2.  price_volatility       — risk / spread metrics
-  3.  monthly_performance    — monthly OHLCV per ticker
-  4.  yearly_performance     — annual OHLCV per ticker
-  5.  top_performers         — all-time % price change
-  6.  volume_leaders         — most traded stocks
-  7.  dividend_analysis      — income / dividend stocks
-  8.  stochastic_signals     — overbought / oversold counts
-  9.  daily_market_breadth   — market-wide daily snapshot
-  10. streaming_window_summary — 1-min window agg (if available)
+FIXES APPLIED
+-------------
+FIX 1 (2026-09-12) — NUM_COLUMNS_MISMATCH on union
+  Replaced manual per-ticker loop + reduce(union) with a single
+  spark.read.schema(CLEAN_SCHEMA).parquet(S3_CLEAN) call.
 
-FIX (2026-09-12)
-----------------
-The previous code manually looped over ticker subdirectories and called
-reduce(DataFrame.union, ...) which blew up with NUM_COLUMNS_MISMATCH when
-any ticker's Parquet file had 13 columns instead of 14.
+FIX 2 (2026-09-12) — SparkFileNotFoundException during schema inference
+  Supplying an explicit CLEAN_SCHEMA skips readParquetFootersInParallel
+  entirely, so files deleted mid-run no longer crash the job at the
+  schema-discovery stage.
 
-Root cause: streaming_job.py writes with partitionBy("ticker"), which
-causes Spark to store ticker as a *directory name* (e.g. clean/ticker=AAPL/)
-rather than as a column inside the Parquet file.  When those partitioned
-files were later read with spark.read.parquet("s3a://stocks/clean/AAPL")
-and then union-ed manually, the ticker column was missing from some files.
+FIX 3 (2026-09-12) — SparkFileNotFoundException during data reads
+  spark.sql.files.ignoreMissingFiles=true makes Spark silently skip any
+  file that disappears between directory listing and the actual read.
+  Removed .cache() to avoid pinning stale file paths.
 
-Fix: replace the manual loop + union with a single
-    spark.read.option("mergeSchema", "true").parquet(S3_CLEAN)
-call.  Spark reads all ticker partition directories at once, automatically
-injects ticker back from the partition path, and handles column-count
-differences across files via schema merging.  A defensive select then
-ensures exactly the 14 canonical columns are present (filling any that are
-genuinely absent with null).
+FIX 4 (2026-09-12) — PSQLException: cannot drop table … other objects depend
+  Spark's mode="overwrite" issues a plain DROP TABLE which PostgreSQL
+  rejects when views from post_analytics.sql exist.  Added drop_views()
+  which runs DROP VIEW … CASCADE via JDBC before the first insight writes,
+  clearing all dependents so every table overwrite succeeds cleanly.
 """
 
 from __future__ import annotations
@@ -54,6 +48,15 @@ import time
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import col, input_file_name, lit, regexp_extract
+from pyspark.sql.types import (
+    DateType,
+    DoubleType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -87,8 +90,7 @@ S3_AGGREGATED = f"s3a://{MINIO_BUCKET}/aggregated"
 
 JDBC_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DB}"
 
-# The 14 canonical columns that every downstream query expects.
-# Order matters — this is also used for the defensive select below.
+# The 14 canonical columns every downstream query expects.
 _CLEAN_COLS = [
     "event_id",
     "ticker",
@@ -104,6 +106,40 @@ _CLEAN_COLS = [
     "stochd_14_3_3",
     "source_file",
     "produced_at",
+]
+
+# Explicit schema for the clean Parquet dataset.
+# "ticker" is intentionally absent — streaming_job.py writes with
+# .partitionBy("ticker"), so Spark stores it as a directory name
+# (ticker=AAPL/) rather than a column inside the Parquet file.
+# Spark reconstructs it automatically from the partition path.
+CLEAN_SCHEMA = StructType([
+    StructField("event_id",      LongType(),      True),
+    StructField("date",          DateType(),      True),
+    StructField("open",          DoubleType(),    True),
+    StructField("high",          DoubleType(),    True),
+    StructField("low",           DoubleType(),    True),
+    StructField("close",         DoubleType(),    True),
+    StructField("volume",        DoubleType(),    True),
+    StructField("dividends",     DoubleType(),    True),
+    StructField("stock_splits",  DoubleType(),    True),
+    StructField("stochk_14_3_3", DoubleType(),    True),
+    StructField("stochd_14_3_3", DoubleType(),    True),
+    StructField("source_file",   StringType(),    True),
+    StructField("produced_at",   TimestampType(), True),
+])
+
+# All views created by post_analytics.sql — must be dropped before
+# mode="overwrite" can DROP TABLE on their underlying tables.
+_VIEWS_TO_DROP = [
+    "v_full_stock_profile",
+    "v_overbought_stocks",
+    "v_market_trend",
+    "v_dividend_champions",
+    "v_most_traded",
+    "v_high_volatility",
+    "v_top_losers",
+    "v_top_gainers",
 ]
 
 
@@ -123,6 +159,8 @@ spark = (
     .config("spark.hadoop.fs.s3a.secret.key",             MINIO_SECRET_KEY)
     .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
     .config("spark.hadoop.fs.s3a.fast.upload",            "true")
+    # ── Tolerate files deleted between listing and read (race with streamer) ─
+    .config("spark.sql.files.ignoreMissingFiles", "true")
     # ── Output ───────────────────────────────────────────────────────────────
     .config("spark.sql.parquet.compression.codec", "snappy")
     # Allow cross-join in some analytic CTEs
@@ -134,8 +172,40 @@ spark.sparkContext.setLogLevel("WARN")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. Helper — write a DataFrame to PostgreSQL via JDBC
+# 3. PostgreSQL helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _jdbc_execute(sql: str) -> None:
+    """Run arbitrary SQL against PostgreSQL via the JDBC driver already on the
+    Spark classpath.  Uses py4j's Java gateway — no extra Python libraries needed.
+    """
+    driver_manager = spark._sc._gateway.jvm.java.sql.DriverManager
+    conn = driver_manager.getConnection(JDBC_URL, PG_USER, PG_PASSWORD)
+    conn.setAutoCommit(True)
+    stmt = conn.createStatement()
+    try:
+        stmt.execute(sql)
+    finally:
+        stmt.close()
+        conn.close()
+
+
+def drop_views() -> None:
+    """Drop all post_analytics views so mode='overwrite' can DROP TABLE freely.
+
+    PostgreSQL refuses to DROP TABLE when views depend on it.  Dropping views
+    first (with IF EXISTS so it's safe on a fresh database) unblocks every
+    subsequent table overwrite.  post_analytics.sql recreates them afterward.
+    """
+    log.info("Dropping dependent views (if they exist) …")
+    for view in _VIEWS_TO_DROP:
+        try:
+            _jdbc_execute(f"DROP VIEW IF EXISTS {view} CASCADE;")
+            log.info("  dropped view %s", view)
+        except Exception as exc:
+            log.warning("  could not drop view %s: %s", view, exc)
+    log.info("Views cleared — table overwrites are now safe.")
+
 
 def to_postgres(df: DataFrame, table: str, mode: str = "overwrite") -> int:
     """Write *df* to PostgreSQL table *table* and return the row count."""
@@ -143,12 +213,12 @@ def to_postgres(df: DataFrame, table: str, mode: str = "overwrite") -> int:
     (
         df.write
         .format("jdbc")
-        .option("url",        JDBC_URL)
-        .option("dbtable",    table)
-        .option("user",       PG_USER)
-        .option("password",   PG_PASSWORD)
-        .option("driver",     "org.postgresql.Driver")
-        .option("batchsize",  "10000")
+        .option("url",           JDBC_URL)
+        .option("dbtable",       table)
+        .option("user",          PG_USER)
+        .option("password",      PG_PASSWORD)
+        .option("driver",        "org.postgresql.Driver")
+        .option("batchsize",     "10000")
         .option("numPartitions", "4")
         .mode(mode)
         .save()
@@ -180,62 +250,35 @@ log.info("  MinIO   : %s  bucket=%s", MINIO_ENDPOINT, MINIO_BUCKET)
 log.info("  Postgres: %s:%s/%s", PG_HOST, PG_PORT, PG_DB)
 log.info("=" * 62)
 
-# ── Clean Parquet — single read with schema merge (FIX) ──────────────────────
-#
-# Why this replaces the old manual loop + reduce(union):
-#
-#   streaming_job.py writes with .partitionBy("ticker"), so on disk the
-#   layout is:
-#       s3a://stocks/clean/ticker=AAPL/part-0.snappy.parquet   ← no ticker col
-#       s3a://stocks/clean/ticker=MSFT/part-0.snappy.parquet   ← no ticker col
-#       ...
-#   Spark automatically reconstructs the "ticker" partition column when you
-#   read the parent path.  The old per-ticker loop read individual
-#   subdirectories and then unioned them, losing that reconstruction for
-#   any ticker whose Parquet happened to be written without the ticker column
-#   explicitly in the file body.
-#
-#   spark.read.option("mergeSchema","true").parquet(S3_CLEAN) reads the
-#   entire partitioned dataset in one shot, injects "ticker" from the
-#   directory name, and merges any minor schema differences across files.
-#
-#   The defensive select at the end guarantees exactly _CLEAN_COLS are
-#   present regardless of how individual files were written.
-
+# ── Clean Parquet — explicit schema, no footer reads ─────────────────────────
 log.info("Loading clean data from %s …", S3_CLEAN)
 try:
     raw_df = (
         spark.read
-        .option("mergeSchema", "true")
+        .schema(CLEAN_SCHEMA)   # explicit schema — skips footer reads entirely
         .parquet(S3_CLEAN)
     )
 
-    # Safety net: if ticker column is still missing (e.g. non-partitioned
-    # layout without the column), derive it from the file path.
+    # Safety net: if ticker is still missing (non-partitioned layout),
+    # derive it from the file path.
     if "ticker" not in raw_df.columns:
-        log.warning(
-            "'ticker' column not found in raw schema — deriving from file path."
-        )
+        log.warning("'ticker' column not found — deriving from file path.")
         raw_df = raw_df.withColumn(
             "ticker",
             regexp_extract(input_file_name(), r"/clean/(?:ticker=)?([^/]+)/", 1),
         )
 
-    # Defensive select: keep exactly _CLEAN_COLS, fill missing ones with null.
+    # Defensive select: guarantee exactly _CLEAN_COLS, fill any gaps with null.
     select_exprs = [
         col(c) if c in raw_df.columns else lit(None).alias(c)
         for c in _CLEAN_COLS
     ]
     clean_df = raw_df.select(*select_exprs)
-    clean_df.cache()
+    # No .cache() — streaming job may overwrite files mid-run.
 
-    total_rows   = clean_df.count()
+    total_rows    = clean_df.count()
     total_tickers = clean_df.select("ticker").distinct().count()
-    log.info(
-        "Clean data loaded  rows=%d  tickers=%d",
-        total_rows,
-        total_tickers,
-    )
+    log.info("Clean data loaded  rows=%d  tickers=%d", total_rows, total_tickers)
 
 except Exception as exc:
     log.error("Cannot read clean data from MinIO: %s", exc)
@@ -258,7 +301,6 @@ try:
         col("event_count"),
         col("window_date"),
     )
-    agg_flat.cache()
     agg_flat.createOrReplaceTempView("aggregated")
     has_aggregated = True
     log.info("Aggregated data loaded  rows=%d", agg_flat.count())
@@ -267,7 +309,14 @@ except Exception:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. SparkSQL Insights
+# 5. Drop dependent PostgreSQL views before overwriting tables
+# ──────────────────────────────────────────────────────────────────────────────
+
+drop_views()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. SparkSQL Insights
 # ──────────────────────────────────────────────────────────────────────────────
 
 wall_start = time.time()
@@ -576,11 +625,11 @@ if has_aggregated:
         """,
     )
 else:
-    log.info("  –  streaming_window_summary skipped (no aggregated data yet)")
+    log.info("  -  streaming_window_summary skipped (no aggregated data yet)")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. Final summary
+# 7. Final summary
 # ──────────────────────────────────────────────────────────────────────────────
 
 elapsed = time.time() - wall_start
@@ -589,7 +638,7 @@ log.info("  Analytics complete in %.1f s", elapsed)
 log.info("  Source rows      : %d", total_rows)
 log.info("  PostgreSQL       : jdbc:postgresql://%s:%s/%s", PG_HOST, PG_PORT, PG_DB)
 log.info("  Tables written   : 9%s", " + 1 window table" if has_aggregated else "")
-log.info("  Run post_analytics.sql in psql to add indexes & views.")
+log.info("  Run post_analytics.sql in psql to restore indexes & views.")
 log.info("=" * 62)
 
 spark.stop()

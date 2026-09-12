@@ -60,7 +60,7 @@ DEFAULT_DATA_DIR = (
     r"C:\Users\moham\Desktop\ETA_FinalProject"
     r"\Data\archive\Data\StockHistory"
 )
-DEFAULT_HOST     = "localhost"
+DEFAULT_HOST     = "127.0.0.1"
 DEFAULT_PORT     = 5432
 DEFAULT_DB       = "stocks_analytics"
 DEFAULT_USER     = "stocks"

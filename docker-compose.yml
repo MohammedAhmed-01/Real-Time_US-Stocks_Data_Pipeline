@@ -262,12 +262,13 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_DB:       ${POSTGRES_DB:-stocks_analytics}
-      POSTGRES_USER:     ${POSTGRES_USER:-stocks}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stocks123}
+      POSTGRES_DB:               ${POSTGRES_DB:-stocks_analytics}
+      POSTGRES_USER:             ${POSTGRES_USER:-stocks}
+      POSTGRES_PASSWORD:         ${POSTGRES_PASSWORD:-stocks123}
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS:      "--auth-host=md5"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      # init_postgres.sql runs once on first container boot
       - ./spark/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stocks} -d ${POSTGRES_DB:-stocks_analytics}"]
@@ -305,7 +306,7 @@ services:
       - --rows-per-sec
       - "10000"
       - --batch-size
-      - "3000"
+      - "2000"
       - --stock-list
       - /app/Stock_List.csv
     volumes:
