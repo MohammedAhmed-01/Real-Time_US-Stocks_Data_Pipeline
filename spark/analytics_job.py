@@ -1,32 +1,48 @@
 """
-analytics_job.py — SparkSQL Analytics: MinIO Parquet → PostgreSQL  [OPTIMISED]
-===============================================================================
+analytics_job.py — SparkSQL Analytics: MinIO Parquet → PostgreSQL
+=================================================================
 M3 · Analytics  |  Real-Time US Stocks Data Pipeline
 
-OPTIMISATIONS vs the original
-------------------------------
-1. numPartitions 4 → 16     — 4× more parallel JDBC writers to PostgreSQL
-2. batchsize 10 000 → 50 000 — larger INSERT batches → fewer round-trips
-3. shuffle.partitions 200 → 48 for batch job (AQE will coalesce further)
-4. Adaptive Query Execution enabled with coalesce partitions
-5. S3A connection pool raised (fs.s3a.connection.maximum 15→100) so the
-   initial full-table Parquet read doesn't bottleneck on S3 connections
-6. clean_df is partitioned to 48 partitions before caching so all 10
-   SQL queries run with proper parallelism
-7. executor/driver memory hints embedded in SparkConf so the job is
-   self-contained and doesn't need extra --conf flags on spark-submit
+Reads clean Parquet and aggregated Parquet from MinIO, runs nine
+SparkSQL insight queries, and writes each result table to PostgreSQL.
 
 Run inside the Spark container:
     spark-submit \\
-      --master local[8] \\
+      --master spark://stocks-spark:7077 \\
       --conf spark.jars.ivy=/tmp/.ivy2 \\
-      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \\
-      --conf "spark.hadoop.fs.s3a.endpoint=http://minio:9000" \\
-      --conf spark.hadoop.fs.s3a.path.style.access=true \\
-      --conf spark.hadoop.fs.s3a.access.key=minioadmin \\
-      --conf spark.hadoop.fs.s3a.secret.key=minioadmin \\
-      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \\
       /opt/spark/work-dir/analytics_job.py
+
+Tables written to PostgreSQL (stocks_analytics):
+  1.  stock_summary          — overall per-ticker stats
+  2.  price_volatility       — risk / spread metrics
+  3.  monthly_performance    — monthly OHLCV per ticker
+  4.  yearly_performance     — annual OHLCV per ticker
+  5.  top_performers         — all-time % price change
+  6.  volume_leaders         — most traded stocks
+  7.  dividend_analysis      — income / dividend stocks
+  8.  stochastic_signals     — overbought / oversold counts
+  9.  daily_market_breadth   — market-wide daily snapshot
+  10. streaming_window_summary — 1-min window agg (if available)
+
+FIX (2026-09-12)
+----------------
+The previous code manually looped over ticker subdirectories and called
+reduce(DataFrame.union, ...) which blew up with NUM_COLUMNS_MISMATCH when
+any ticker's Parquet file had 13 columns instead of 14.
+
+Root cause: streaming_job.py writes with partitionBy("ticker"), which
+causes Spark to store ticker as a *directory name* (e.g. clean/ticker=AAPL/)
+rather than as a column inside the Parquet file.  When those partitioned
+files were later read with spark.read.parquet("s3a://stocks/clean/AAPL")
+and then union-ed manually, the ticker column was missing from some files.
+
+Fix: replace the manual loop + union with a single
+    spark.read.option("mergeSchema", "true").parquet(S3_CLEAN)
+call.  Spark reads all ticker partition directories at once, automatically
+injects ticker back from the partition path, and handles column-count
+differences across files via schema merging.  A defensive select then
+ensures exactly the 14 canonical columns are present (filling any that are
+genuinely absent with null).
 """
 
 from __future__ import annotations
@@ -50,6 +66,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Configuration
 # ──────────────────────────────────────────────────────────────────────────────
@@ -70,23 +87,28 @@ S3_AGGREGATED = f"s3a://{MINIO_BUCKET}/aggregated"
 
 JDBC_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DB}"
 
-# Number of parallel JDBC partitions — each opens its own DB connection
-# and writes its slice of rows concurrently.  Matches max_connections=200.
-JDBC_NUM_PARTITIONS = 16   # was 4
-
-# Rows sent per INSERT statement — larger = fewer round-trips to PostgreSQL
-JDBC_BATCH_SIZE = 50_000   # was 10 000
-
+# The 14 canonical columns that every downstream query expects.
+# Order matters — this is also used for the defensive select below.
 _CLEAN_COLS = [
-    "event_id", "ticker", "date",
-    "open", "high", "low", "close", "volume",
-    "dividends", "stock_splits",
-    "stochk_14_3_3", "stochd_14_3_3",
-    "source_file", "produced_at",
+    "event_id",
+    "ticker",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "dividends",
+    "stock_splits",
+    "stochk_14_3_3",
+    "stochd_14_3_3",
+    "source_file",
+    "produced_at",
 ]
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# 2. SparkSession — tuned for batch analytics throughput
+# 2. SparkSession — S3A connector for MinIO
 # ──────────────────────────────────────────────────────────────────────────────
 
 spark = (
@@ -101,53 +123,33 @@ spark = (
     .config("spark.hadoop.fs.s3a.secret.key",             MINIO_SECRET_KEY)
     .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
     .config("spark.hadoop.fs.s3a.fast.upload",            "true")
-    # Raise S3A connection pool for the large parallel Parquet read
-    .config("spark.hadoop.fs.s3a.connection.maximum",     "100")   # was default 15
-    .config("spark.hadoop.fs.s3a.threads.max",            "20")
-    .config("spark.hadoop.fs.s3a.max.total.tasks",        "30")
     # ── Output ───────────────────────────────────────────────────────────────
     .config("spark.sql.parquet.compression.codec", "snappy")
     # Allow cross-join in some analytic CTEs
     .config("spark.sql.crossJoin.enabled", "true")
-    # ── Performance ──────────────────────────────────────────────────────────
-    # 48 shuffle partitions for analytics (AQE will coalesce small ones)
-    .config("spark.sql.shuffle.partitions",                "48")    # was 200 default
-    # Adaptive Query Execution: auto-coalesces small partitions, fixes skew
-    .config("spark.sql.adaptive.enabled",                  "true")
-    .config("spark.sql.adaptive.coalescePartitions.enabled",      "true")
-    .config("spark.sql.adaptive.coalescePartitions.minPartitionNum", "4")
-    .config("spark.sql.adaptive.skewJoin.enabled",                "true")
-    # Memory
-    .config("spark.memory.fraction",       "0.8")
-    .config("spark.memory.storageFraction","0.3")
     .getOrCreate()
 )
 
 spark.sparkContext.setLogLevel("WARN")
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. Helper — write a DataFrame to PostgreSQL via JDBC  (OPTIMISED)
+# 3. Helper — write a DataFrame to PostgreSQL via JDBC
 # ──────────────────────────────────────────────────────────────────────────────
 
 def to_postgres(df: DataFrame, table: str, mode: str = "overwrite") -> int:
-    """Write *df* to PostgreSQL and return row count.
-
-    Uses numPartitions=16 (was 4) and batchsize=50000 (was 10000) for
-    significantly higher write throughput on the tuned PostgreSQL instance.
-    """
+    """Write *df* to PostgreSQL table *table* and return the row count."""
     row_count = df.count()
     (
         df.write
         .format("jdbc")
-        .option("url",            JDBC_URL)
-        .option("dbtable",        table)
-        .option("user",           PG_USER)
-        .option("password",       PG_PASSWORD)
-        .option("driver",         "org.postgresql.Driver")
-        .option("batchsize",      str(JDBC_BATCH_SIZE))
-        .option("numPartitions",  str(JDBC_NUM_PARTITIONS))
-        # Disable auto-commit inside each partition writer for bulk speed
-        .option("isolationLevel", "NONE")
+        .option("url",        JDBC_URL)
+        .option("dbtable",    table)
+        .option("user",       PG_USER)
+        .option("password",   PG_PASSWORD)
+        .option("driver",     "org.postgresql.Driver")
+        .option("batchsize",  "10000")
+        .option("numPartitions", "4")
         .mode(mode)
         .save()
     )
@@ -155,6 +157,7 @@ def to_postgres(df: DataFrame, table: str, mode: str = "overwrite") -> int:
 
 
 def run_insight(label: str, sql: str, table: str) -> None:
+    """Execute a SparkSQL query, write result to Postgres, log outcome."""
     t0 = time.time()
     try:
         df = spark.sql(sql)
@@ -172,11 +175,32 @@ def run_insight(label: str, sql: str, table: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 log.info("=" * 62)
-log.info("  US Stocks Analytics Job  [OPTIMISED]")
+log.info("  US Stocks Analytics Job")
 log.info("  MinIO   : %s  bucket=%s", MINIO_ENDPOINT, MINIO_BUCKET)
-log.info("  Postgres: %s:%s/%s  (numPartitions=%d  batchsize=%d)",
-         PG_HOST, PG_PORT, PG_DB, JDBC_NUM_PARTITIONS, JDBC_BATCH_SIZE)
+log.info("  Postgres: %s:%s/%s", PG_HOST, PG_PORT, PG_DB)
 log.info("=" * 62)
+
+# ── Clean Parquet — single read with schema merge (FIX) ──────────────────────
+#
+# Why this replaces the old manual loop + reduce(union):
+#
+#   streaming_job.py writes with .partitionBy("ticker"), so on disk the
+#   layout is:
+#       s3a://stocks/clean/ticker=AAPL/part-0.snappy.parquet   ← no ticker col
+#       s3a://stocks/clean/ticker=MSFT/part-0.snappy.parquet   ← no ticker col
+#       ...
+#   Spark automatically reconstructs the "ticker" partition column when you
+#   read the parent path.  The old per-ticker loop read individual
+#   subdirectories and then unioned them, losing that reconstruction for
+#   any ticker whose Parquet happened to be written without the ticker column
+#   explicitly in the file body.
+#
+#   spark.read.option("mergeSchema","true").parquet(S3_CLEAN) reads the
+#   entire partitioned dataset in one shot, injects "ticker" from the
+#   directory name, and merges any minor schema differences across files.
+#
+#   The defensive select at the end guarantees exactly _CLEAN_COLS are
+#   present regardless of how individual files were written.
 
 log.info("Loading clean data from %s …", S3_CLEAN)
 try:
@@ -186,24 +210,32 @@ try:
         .parquet(S3_CLEAN)
     )
 
+    # Safety net: if ticker column is still missing (e.g. non-partitioned
+    # layout without the column), derive it from the file path.
     if "ticker" not in raw_df.columns:
-        log.warning("'ticker' column missing — deriving from file path.")
+        log.warning(
+            "'ticker' column not found in raw schema — deriving from file path."
+        )
         raw_df = raw_df.withColumn(
             "ticker",
             regexp_extract(input_file_name(), r"/clean/(?:ticker=)?([^/]+)/", 1),
         )
 
+    # Defensive select: keep exactly _CLEAN_COLS, fill missing ones with null.
     select_exprs = [
         col(c) if c in raw_df.columns else lit(None).alias(c)
         for c in _CLEAN_COLS
     ]
-    # Repartition to 48 before caching so all 10 SQL queries run in parallel
-    clean_df = raw_df.select(*select_exprs).repartition(48)
+    clean_df = raw_df.select(*select_exprs)
     clean_df.cache()
 
-    total_rows    = clean_df.count()
+    total_rows   = clean_df.count()
     total_tickers = clean_df.select("ticker").distinct().count()
-    log.info("Clean data loaded  rows=%d  tickers=%d", total_rows, total_tickers)
+    log.info(
+        "Clean data loaded  rows=%d  tickers=%d",
+        total_rows,
+        total_tickers,
+    )
 
 except Exception as exc:
     log.error("Cannot read clean data from MinIO: %s", exc)
@@ -212,6 +244,7 @@ except Exception as exc:
 
 clean_df.createOrReplaceTempView("stocks")
 
+# ── Aggregated (streaming window Parquet) ─────────────────────────────────────
 has_aggregated = False
 try:
     log.info("Loading aggregated data from %s …", S3_AGGREGATED)
@@ -232,8 +265,9 @@ try:
 except Exception:
     log.warning("Aggregated data not available — window insight will be skipped.")
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. SparkSQL Insights  (queries unchanged — only infra is faster)
+# 5. SparkSQL Insights
 # ──────────────────────────────────────────────────────────────────────────────
 
 wall_start = time.time()
@@ -356,41 +390,48 @@ run_insight(
     """,
 )
 
-# ── INSIGHT 5: Top Performers ────────────────────────────────────────────────
+# ── INSIGHT 5: Top Performers (all-time % price change) ──────────────────────
 run_insight(
     label="Top Performers",
     table="top_performers",
     sql="""
         WITH bounds AS (
-            SELECT ticker, MIN(date) AS first_date, MAX(date) AS last_date
-            FROM stocks GROUP BY ticker
+            SELECT
+                ticker,
+                MIN(date)  AS first_date,
+                MAX(date)  AS last_date
+            FROM stocks
+            GROUP BY ticker
         ),
         first_p AS (
             SELECT s.ticker, AVG(s.close) AS first_close
-            FROM stocks s JOIN bounds b ON s.ticker = b.ticker AND s.date = b.first_date
+            FROM stocks s
+            JOIN bounds b ON s.ticker = b.ticker AND s.date = b.first_date
             GROUP BY s.ticker
         ),
         last_p AS (
             SELECT s.ticker, AVG(s.close) AS last_close
-            FROM stocks s JOIN bounds b ON s.ticker = b.ticker AND s.date = b.last_date
+            FROM stocks s
+            JOIN bounds b ON s.ticker = b.ticker AND s.date = b.last_date
             GROUP BY s.ticker
         )
         SELECT
             b.ticker,
             b.first_date,
             b.last_date,
-            DATEDIFF(b.last_date, b.first_date)         AS days_held,
-            ROUND(fp.first_close, 4)                     AS first_close,
-            ROUND(lp.last_close,  4)                     AS last_close,
-            ROUND(lp.last_close - fp.first_close, 4)     AS absolute_change,
+            DATEDIFF(b.last_date, b.first_date)            AS days_held,
+            ROUND(fp.first_close, 4)                        AS first_close,
+            ROUND(lp.last_close,  4)                        AS last_close,
+            ROUND(lp.last_close - fp.first_close, 4)        AS absolute_change,
             ROUND(
                 (lp.last_close - fp.first_close)
-                / NULLIF(fp.first_close, 0) * 100, 2)   AS pct_change,
+                / NULLIF(fp.first_close, 0) * 100,
+            2)                                              AS pct_change,
             CASE
                 WHEN lp.last_close > fp.first_close THEN 'GAINER'
                 WHEN lp.last_close < fp.first_close THEN 'LOSER'
                 ELSE 'FLAT'
-            END                                          AS direction
+            END                                             AS direction
         FROM bounds b
         JOIN first_p fp ON b.ticker = fp.ticker
         JOIN last_p  lp ON b.ticker = lp.ticker
@@ -404,18 +445,20 @@ run_insight(
     table="volume_leaders",
     sql="""
         WITH with_avg AS (
-            SELECT ticker, volume,
-                   AVG(volume) OVER (PARTITION BY ticker) AS avg_vol_per_ticker
+            SELECT
+                ticker,
+                volume,
+                AVG(volume) OVER (PARTITION BY ticker) AS avg_vol_per_ticker
             FROM stocks
         )
         SELECT
             ticker,
-            CAST(SUM(volume)   AS BIGINT)                               AS total_volume,
-            ROUND(AVG(volume), 2)                                        AS avg_daily_volume,
-            CAST(MAX(volume)   AS BIGINT)                               AS max_single_day_volume,
-            CAST(MIN(volume)   AS BIGINT)                               AS min_single_day_volume,
-            ROUND(STDDEV(volume), 2)                                     AS volume_stddev,
-            COUNT(*)                                                     AS trading_days,
+            CAST(SUM(volume)    AS BIGINT)                          AS total_volume,
+            ROUND(AVG(volume),  2)                                  AS avg_daily_volume,
+            CAST(MAX(volume)    AS BIGINT)                          AS max_single_day_volume,
+            CAST(MIN(volume)    AS BIGINT)                          AS min_single_day_volume,
+            ROUND(STDDEV(volume), 2)                                AS volume_stddev,
+            COUNT(*)                                                AS trading_days,
             COUNT(CASE WHEN volume > 2 * avg_vol_per_ticker THEN 1 END) AS high_volume_days
         FROM with_avg
         GROUP BY ticker
@@ -432,11 +475,15 @@ run_insight(
             ticker,
             COUNT(CASE WHEN dividends > 0 THEN 1 END)           AS num_dividend_events,
             ROUND(SUM(dividends),   4)                           AS total_dividends_paid,
-            ROUND(AVG(CASE WHEN dividends > 0 THEN dividends END), 4) AS avg_dividend_per_event,
+            ROUND(
+                AVG(CASE WHEN dividends > 0 THEN dividends END),
+            4)                                                   AS avg_dividend_per_event,
             ROUND(MAX(dividends),   4)                           AS max_single_dividend,
             MIN(CASE WHEN dividends > 0 THEN date END)           AS first_dividend_date,
             MAX(CASE WHEN dividends > 0 THEN date END)           AS last_dividend_date,
-            ROUND(SUM(dividends) / NULLIF(AVG(close), 0) * 100, 4) AS approx_dividend_yield_pct
+            ROUND(
+                SUM(dividends) / NULLIF(AVG(close), 0) * 100,
+            4)                                                   AS approx_dividend_yield_pct
         FROM stocks
         GROUP BY ticker
         HAVING SUM(dividends) > 0
@@ -451,22 +498,27 @@ run_insight(
     sql="""
         SELECT
             ticker,
-            COUNT(*)                                                           AS rows_with_stoch,
-            SUM(CASE WHEN stochk_14_3_3 > 80 THEN 1 ELSE 0 END)               AS overbought_k,
-            SUM(CASE WHEN stochk_14_3_3 < 20 THEN 1 ELSE 0 END)               AS oversold_k,
-            SUM(CASE WHEN stochk_14_3_3 BETWEEN 20 AND 80 THEN 1 ELSE 0 END)  AS neutral_k,
-            ROUND(AVG(stochk_14_3_3), 2)                                       AS avg_stochk,
-            ROUND(AVG(stochd_14_3_3), 2)                                       AS avg_stochd,
-            ROUND(MAX(stochk_14_3_3), 2)                                       AS max_stochk,
-            ROUND(MIN(stochk_14_3_3), 2)                                       AS min_stochk,
-            SUM(CASE WHEN stochk_14_3_3 > stochd_14_3_3 THEN 1 ELSE 0 END)   AS k_above_d,
-            SUM(CASE WHEN stochk_14_3_3 < stochd_14_3_3 THEN 1 ELSE 0 END)   AS k_below_d,
-            ROUND(SUM(CASE WHEN stochk_14_3_3 > 80 THEN 1 ELSE 0 END) * 100.0
-                  / NULLIF(COUNT(*), 0), 2)                                    AS overbought_rate_pct,
-            ROUND(SUM(CASE WHEN stochk_14_3_3 < 20 THEN 1 ELSE 0 END) * 100.0
-                  / NULLIF(COUNT(*), 0), 2)                                    AS oversold_rate_pct
+            COUNT(*)                                                          AS rows_with_stoch,
+            SUM(CASE WHEN stochk_14_3_3 > 80 THEN 1 ELSE 0 END)              AS overbought_k,
+            SUM(CASE WHEN stochk_14_3_3 < 20 THEN 1 ELSE 0 END)              AS oversold_k,
+            SUM(CASE WHEN stochk_14_3_3 BETWEEN 20 AND 80 THEN 1 ELSE 0 END) AS neutral_k,
+            ROUND(AVG(stochk_14_3_3), 2)                                      AS avg_stochk,
+            ROUND(AVG(stochd_14_3_3), 2)                                      AS avg_stochd,
+            ROUND(MAX(stochk_14_3_3), 2)                                      AS max_stochk,
+            ROUND(MIN(stochk_14_3_3), 2)                                      AS min_stochk,
+            SUM(CASE WHEN stochk_14_3_3 > stochd_14_3_3 THEN 1 ELSE 0 END)  AS k_above_d,
+            SUM(CASE WHEN stochk_14_3_3 < stochd_14_3_3 THEN 1 ELSE 0 END)  AS k_below_d,
+            ROUND(
+                SUM(CASE WHEN stochk_14_3_3 > 80 THEN 1 ELSE 0 END) * 100.0
+                / NULLIF(COUNT(*), 0),
+            2)                                                                AS overbought_rate_pct,
+            ROUND(
+                SUM(CASE WHEN stochk_14_3_3 < 20 THEN 1 ELSE 0 END) * 100.0
+                / NULLIF(COUNT(*), 0),
+            2)                                                                AS oversold_rate_pct
         FROM stocks
-        WHERE stochk_14_3_3 IS NOT NULL AND stochd_14_3_3 IS NOT NULL
+        WHERE stochk_14_3_3 IS NOT NULL
+          AND stochd_14_3_3 IS NOT NULL
         GROUP BY ticker
         ORDER BY overbought_k DESC
     """,
@@ -479,22 +531,26 @@ run_insight(
     sql="""
         SELECT
             date,
-            COUNT(DISTINCT ticker)                                    AS active_stocks,
-            CAST(SUM(volume)    AS BIGINT)                            AS total_market_volume,
-            ROUND(AVG(close),   4)                                    AS avg_close,
-            ROUND(AVG(open),    4)                                    AS avg_open,
-            ROUND(AVG(high),    4)                                    AS avg_high,
-            ROUND(AVG(low),     4)                                    AS avg_low,
-            COUNT(CASE WHEN close > open THEN 1 END)                  AS advancing_stocks,
-            COUNT(CASE WHEN close < open THEN 1 END)                  AS declining_stocks,
-            COUNT(CASE WHEN close = open THEN 1 END)                  AS unchanged_stocks,
-            ROUND(COUNT(CASE WHEN close > open THEN 1 END) * 100.0
-                  / NULLIF(COUNT(*), 0), 2)                           AS advance_decline_pct,
-            ROUND(AVG((close - open) / NULLIF(open, 0) * 100), 4)    AS avg_price_change_pct,
-            ROUND(SUM(dividends), 4)                                  AS total_dividends_paid,
-            ROUND(AVG(high - low), 4)                                 AS avg_daily_range,
-            SUM(CASE WHEN stochk_14_3_3 > 80 THEN 1 ELSE 0 END)      AS overbought_count,
-            SUM(CASE WHEN stochk_14_3_3 < 20 THEN 1 ELSE 0 END)      AS oversold_count
+            COUNT(DISTINCT ticker)                                   AS active_stocks,
+            CAST(SUM(volume)    AS BIGINT)                           AS total_market_volume,
+            ROUND(AVG(close),   4)                                   AS avg_close,
+            ROUND(AVG(open),    4)                                   AS avg_open,
+            ROUND(AVG(high),    4)                                   AS avg_high,
+            ROUND(AVG(low),     4)                                   AS avg_low,
+            COUNT(CASE WHEN close > open THEN 1 END)                 AS advancing_stocks,
+            COUNT(CASE WHEN close < open THEN 1 END)                 AS declining_stocks,
+            COUNT(CASE WHEN close = open THEN 1 END)                 AS unchanged_stocks,
+            ROUND(
+                COUNT(CASE WHEN close > open THEN 1 END) * 100.0
+                / NULLIF(COUNT(*), 0),
+            2)                                                       AS advance_decline_pct,
+            ROUND(
+                AVG((close - open) / NULLIF(open, 0) * 100),
+            4)                                                       AS avg_price_change_pct,
+            ROUND(SUM(dividends), 4)                                 AS total_dividends_paid,
+            ROUND(AVG(high - low), 4)                                AS avg_daily_range,
+            SUM(CASE WHEN stochk_14_3_3 > 80 THEN 1 ELSE 0 END)     AS overbought_count,
+            SUM(CASE WHEN stochk_14_3_3 < 20 THEN 1 ELSE 0 END)     AS oversold_count
         FROM stocks
         GROUP BY date
         ORDER BY date
@@ -512,8 +568,8 @@ if has_aggregated:
                 window_date,
                 window_start,
                 window_end,
-                ROUND(avg_close,  4)         AS avg_close,
-                CAST(total_volume AS BIGINT)  AS total_volume,
+                ROUND(avg_close,  4)            AS avg_close,
+                CAST(total_volume AS BIGINT)     AS total_volume,
                 event_count
             FROM aggregated
             ORDER BY ticker, window_start
@@ -521,6 +577,7 @@ if has_aggregated:
     )
 else:
     log.info("  –  streaming_window_summary skipped (no aggregated data yet)")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 6. Final summary

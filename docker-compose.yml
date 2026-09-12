@@ -1,15 +1,22 @@
 ##############################################################################
-#  docker-compose.yml — OPTIMIZED for maximum throughput
-#  Kafka Cluster + Spark + MinIO + PostgreSQL
+#  docker-compose.yml — Kafka Cluster + Spark + MinIO + PostgreSQL
+#  M1 · Data & Kafka  +  M2 · Spark Streaming  +  M3 · SparkSQL Analytics
 #  Real-Time US Stocks Data Pipeline
 #
-#  KEY OPTIMISATIONS vs the original:
-#   Producer  : rows-per-sec 500→5000, batch-size 250→1000, queue 5→20
-#   Consumer  : batch-size 100→500, max-wait-ms 5000→2000, idle-timeout 180→300
-#   Spark     : executor memory 2g→6g, driver memory 2g→4g
-#   Spark Worker: memory 4g→8g, cores 4→8
-#   PostgreSQL: shared_buffers, work_mem, max_connections tuned
-#   MinIO     : MINIO_API_REQUESTS_MAX raised for high-throughput Spark writes
+#  MinIO acts as an S3-compatible object store for Parquet data.
+#  PostgreSQL stores SparkSQL analytics output (analytics_job.py).
+#
+#  NOTE (2026-09-12): minio/minio and minio/mc were pulled from Docker Hub
+#  after MinIO stopped publishing free community-edition images. The minio
+#  service now uses elestio/minio (Docker Hub Verified Publisher, tracks
+#  upstream releases) and minio-init uses a pinned minio/mc tag that was
+#  pushed before the cutoff and is still pullable.
+#
+#  MinIO console  : http://localhost:9001   (minioadmin / minioadmin)
+#  MinIO API      : http://localhost:9000
+#  Spark Master   : http://localhost:8081
+#  Kafka UI       : http://localhost:8080
+#  PostgreSQL     : localhost:5432  (stocks / stocks123)
 ##############################################################################
 
 services:
@@ -43,19 +50,9 @@ services:
       KAFKA_DELETE_TOPIC_ENABLE:                         "true"
       KAFKA_LOG_RETENTION_HOURS:                         168
       KAFKA_LOG_SEGMENT_BYTES:                           1073741824
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS:            0       # was 100 — faster consumer startup
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS:            100
       KAFKA_COMPRESSION_TYPE:                            lz4
       KAFKA_LOG_DIRS:                                    /var/lib/kafka/data
-      # ── Throughput tuning ───────────────────────────────────────────────
-      KAFKA_SOCKET_SEND_BUFFER_BYTES:                    1048576   # 1 MB
-      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES:                 1048576   # 1 MB
-      KAFKA_SOCKET_REQUEST_MAX_BYTES:                    104857600 # 100 MB
-      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES:                 50000
-      KAFKA_LOG_FLUSH_INTERVAL_MS:                       1000
-      KAFKA_NUM_NETWORK_THREADS:                         6         # was default 3
-      KAFKA_NUM_IO_THREADS:                              8         # was default 8, explicit
-      KAFKA_REPLICA_FETCH_MAX_BYTES:                     10485760  # 10 MB
-      KAFKA_MESSAGE_MAX_BYTES:                           10485760  # 10 MB
     volumes:
       - kafka-1-data:/var/lib/kafka/data
     healthcheck:
@@ -94,18 +91,9 @@ services:
       KAFKA_DELETE_TOPIC_ENABLE:                         "true"
       KAFKA_LOG_RETENTION_HOURS:                         168
       KAFKA_LOG_SEGMENT_BYTES:                           1073741824
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS:            0
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS:            100
       KAFKA_COMPRESSION_TYPE:                            lz4
       KAFKA_LOG_DIRS:                                    /var/lib/kafka/data
-      KAFKA_SOCKET_SEND_BUFFER_BYTES:                    1048576
-      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES:                 1048576
-      KAFKA_SOCKET_REQUEST_MAX_BYTES:                    104857600
-      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES:                 50000
-      KAFKA_LOG_FLUSH_INTERVAL_MS:                       1000
-      KAFKA_NUM_NETWORK_THREADS:                         6
-      KAFKA_NUM_IO_THREADS:                              8
-      KAFKA_REPLICA_FETCH_MAX_BYTES:                     10485760
-      KAFKA_MESSAGE_MAX_BYTES:                           10485760
     volumes:
       - kafka-2-data:/var/lib/kafka/data
     healthcheck:
@@ -144,18 +132,9 @@ services:
       KAFKA_DELETE_TOPIC_ENABLE:                         "true"
       KAFKA_LOG_RETENTION_HOURS:                         168
       KAFKA_LOG_SEGMENT_BYTES:                           1073741824
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS:            0
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS:            100
       KAFKA_COMPRESSION_TYPE:                            lz4
       KAFKA_LOG_DIRS:                                    /var/lib/kafka/data
-      KAFKA_SOCKET_SEND_BUFFER_BYTES:                    1048576
-      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES:                 1048576
-      KAFKA_SOCKET_REQUEST_MAX_BYTES:                    104857600
-      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES:                 50000
-      KAFKA_LOG_FLUSH_INTERVAL_MS:                       1000
-      KAFKA_NUM_NETWORK_THREADS:                         6
-      KAFKA_NUM_IO_THREADS:                              8
-      KAFKA_REPLICA_FETCH_MAX_BYTES:                     10485760
-      KAFKA_MESSAGE_MAX_BYTES:                           10485760
     volumes:
       - kafka-3-data:/var/lib/kafka/data
     healthcheck:
@@ -165,7 +144,7 @@ services:
       retries: 10
       start_period: 30s
 
-  # ── Topic initialiser ─────────────────────────────────────────────────────
+  # ── Topic initialiser (runs once, then exits) ──────────────────────────────
   kafka-init:
     image: confluentinc/cp-kafka:7.6.1
     container_name: kafka-init
@@ -192,8 +171,7 @@ services:
           --topic us-stocks-raw --partitions 6 --replication-factor 3 \
           --config retention.ms=604800000 \
           --config compression.type=lz4 \
-          --config min.insync.replicas=2 \
-          --config max.message.bytes=10485760
+          --config min.insync.replicas=2
 
         echo '  Creating topic: us-stocks-dead-letter'
         kafka-topics --bootstrap-server kafka-1:29092 --create --if-not-exists \
@@ -205,12 +183,19 @@ services:
         echo '  All topics:'
         kafka-topics --bootstrap-server kafka-1:29092 --list
 
+        echo ''
+        echo '  Details - us-stocks-raw:'
+        kafka-topics --bootstrap-server kafka-1:29092 --describe --topic us-stocks-raw
+
         echo '--------------------------------------------------'
         echo '  Topics ready. Done.'
         echo '--------------------------------------------------'
     restart: "no"
 
-  # ── MinIO ─────────────────────────────────────────────────────────────────
+  # ── MinIO — S3-compatible object store (replaces HDFS) ────────────────────
+  # minio/minio was pulled from Docker Hub (MinIO stopped publishing free
+  # community images). elestio/minio is a Docker Hub Verified Publisher
+  # image that stays in sync with upstream MinIO releases.
   minio:
     image: elestio/minio:latest
     container_name: stocks-minio
@@ -218,14 +203,11 @@ services:
     networks:
       - stocks-net
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:9000"    # S3 API  — used by Spark S3A connector
+      - "9001:9001"    # Web console — http://localhost:9001
     environment:
-      MINIO_ROOT_USER:              ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD:          ${MINIO_SECRET_KEY:-minioadmin}
-      # ── Throughput tuning ─────────────────────────────────────────────────
-      MINIO_API_REQUESTS_MAX:       600      # allow more concurrent S3 ops
-      MINIO_API_REQUESTS_DEADLINE:  10m
+      MINIO_ROOT_USER:     ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
     command: server --address ":9000" --console-address ":9001" /data
     volumes:
       - minio-data:/data
@@ -236,7 +218,14 @@ services:
       retries: 5
       start_period: 10s
 
-  # ── MinIO bucket initialiser ──────────────────────────────────────────────
+  # ── MinIO bucket initialiser (runs once, then exits) ──────────────────────
+  # Every mc container image we tried has turned out unreliable
+  # (minio/mc removed from Docker Hub; cgr.dev/chainguard/mc needs an org
+  # context; the Docker Hub mirror's -dev tag availability is unconfirmed).
+  # Instead of chasing another registry, this downloads the mc BINARY
+  # directly from dl.min.io — MinIO's own CDN, separate from their Docker
+  # Hub distribution, and still serving binaries as of April 2026 — inside
+  # a plain alpine image, which is one of the most stable images on Docker Hub.
   minio-init:
     image: elestio/minio:latest
     container_name: stocks-minio-init
@@ -252,15 +241,18 @@ services:
     command:
       - |
         set -e
+
         echo "Setting MinIO alias..."
         mc alias set local http://minio:9000 \
           "$${MINIO_ACCESS_KEY}" "$${MINIO_SECRET_KEY}"
+
         echo "Creating stocks bucket..."
         mc mb --ignore-existing local/stocks
+
         echo 'Bucket "stocks" is ready.'
     restart: "no"
 
-  # ── PostgreSQL — tuned for bulk JDBC writes ───────────────────────────────
+  # ── PostgreSQL — analytics output store ───────────────────────────────────
   postgres:
     image: postgres:16
     container_name: stocks-postgres
@@ -273,33 +265,9 @@ services:
       POSTGRES_DB:       ${POSTGRES_DB:-stocks_analytics}
       POSTGRES_USER:     ${POSTGRES_USER:-stocks}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stocks123}
-    # Pass performance parameters directly — no need for a custom postgresql.conf
-    command:
-      - postgres
-      - -c
-      - shared_buffers=512MB
-      - -c
-      - work_mem=64MB
-      - -c
-      - maintenance_work_mem=256MB
-      - -c
-      - effective_cache_size=1536MB
-      - -c
-      - max_connections=200
-      - -c
-      - synchronous_commit=off         # safe speed-up for analytics bulk load
-      - -c
-      - checkpoint_completion_target=0.9
-      - -c
-      - wal_buffers=64MB
-      - -c
-      - max_wal_size=2GB
-      - -c
-      - random_page_cost=1.1
-      - -c
-      - effective_io_concurrency=200
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # init_postgres.sql runs once on first container boot
       - ./spark/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stocks} -d ${POSTGRES_DB:-stocks_analytics}"]
@@ -308,9 +276,7 @@ services:
       retries: 5
       start_period: 15s
 
-  # ── Producer — OPTIMISED ──────────────────────────────────────────────────
-  # rows-per-sec : 500  → 5 000   (10× faster ingestion)
-  # batch-size   : 250  → 1 000   (fewer round-trips to Kafka)
+  # ── Producer (streams Kaggle → Kafka) ─────────────────────────────────────
   producer:
     build:
       context: .
@@ -337,18 +303,15 @@ services:
       - python
       - producer.py
       - --rows-per-sec
-      - "5000"          # was 500
+      - "10000"
       - --batch-size
-      - "1000"          # was 250
+      - "3000"
       - --stock-list
       - /app/Stock_List.csv
     volumes:
       - ./kafka:/app
 
-  # ── Consumer / validator — OPTIMISED ─────────────────────────────────────
-  # batch-size   : 100  → 500     (larger batches, fewer commits)
-  # max-wait-ms  : 5000 → 2000    (flush more frequently)
-  # idle-timeout : 180  → 300     (more patient waiting for slow producers)
+  # ── Consumer / validator ───────────────────────────────────────────────────
   consumer:
     build:
       context: .
@@ -374,15 +337,15 @@ services:
       - python
       - consumer.py
       - --batch-size
-      - "500"           # was 100
+      - "100"
       - --max-wait-ms
-      - "2000"          # was 5000
+      - "5000"
       - --idle-timeout
-      - "300"           # was 180
+      - "180"
     volumes:
       - ./kafka:/app
 
-  # ── Kafka UI ──────────────────────────────────────────────────────────────
+  # ── Kafka UI  (http://localhost:8080) ──────────────────────────────────────
   kafka-ui:
     image: ghcr.io/kafbat/kafka-ui:latest
     container_name: kafka-ui
@@ -400,7 +363,7 @@ services:
       KAFKA_CLUSTERS_0_AUDIT_TOPICAUDITENABLED: "false"
       DYNAMIC_CONFIG_ENABLED:                   "true"
 
-  # ── Spark Master — OPTIMISED ─────────────────────────────────────────────
+  # ── Spark Master ───────────────────────────────────────────────────────────
   spark:
     build:
       context: ./spark
@@ -426,25 +389,22 @@ services:
       - org.apache.spark.deploy.master.Master
     ports:
       - "7077:7077"
-      - "8081:8080"
+      - "8081:8080"   # Spark Master web UI
     environment:
       MINIO_ENDPOINT:   http://minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
       MINIO_BUCKET:     ${MINIO_BUCKET:-stocks}
+      # PostgreSQL — consumed by analytics_job.py
       POSTGRES_HOST:     postgres
       POSTGRES_PORT:     5432
       POSTGRES_DB:       ${POSTGRES_DB:-stocks_analytics}
       POSTGRES_USER:     ${POSTGRES_USER:-stocks}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stocks123}
-      # ── JVM heap for the master process ───────────────────────────────────
-      SPARK_MASTER_OPTS: "-Xms512m -Xmx1g"
     volumes:
       - ./spark:/opt/spark/work-dir
 
-  # ── Spark Worker — OPTIMISED ─────────────────────────────────────────────
-  # memory : 4g → 8g   (fits larger micro-batches without spill)
-  # cores  : 4  → 8    (more parallelism for analytics queries)
+  # ── Spark Worker ───────────────────────────────────────────────────────────
   spark-worker:
     image: stocks-spark:3.5.7
     container_name: stocks-spark-worker
@@ -458,21 +418,21 @@ services:
       - org.apache.spark.deploy.worker.Worker
       - spark://stocks-spark:7077
     environment:
-      MINIO_ENDPOINT:      http://minio:9000
-      MINIO_ACCESS_KEY:    ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_SECRET_KEY:    ${MINIO_SECRET_KEY:-minioadmin}
-      MINIO_BUCKET:        ${MINIO_BUCKET:-stocks}
-      SPARK_WORKER_MEMORY: 8g        # was 4g
-      SPARK_WORKER_CORES:  8         # was 4
-      POSTGRES_HOST:       postgres
-      POSTGRES_PORT:       5432
-      POSTGRES_DB:         ${POSTGRES_DB:-stocks_analytics}
-      POSTGRES_USER:       ${POSTGRES_USER:-stocks}
-      POSTGRES_PASSWORD:   ${POSTGRES_PASSWORD:-stocks123}
+      MINIO_ENDPOINT:   http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET:     ${MINIO_BUCKET:-stocks}
+      SPARK_WORKER_MEMORY: 4g
+      SPARK_WORKER_CORES:  4
+      # PostgreSQL — consumed by analytics_job.py
+      POSTGRES_HOST:     postgres
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB:-stocks_analytics}
+      POSTGRES_USER:     ${POSTGRES_USER:-stocks}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stocks123}
     volumes:
       - ./spark:/opt/spark/work-dir
 
-  # ── pgAdmin ───────────────────────────────────────────────────────────────
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: stocks-pgadmin
@@ -487,16 +447,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-
-# ── Named volumes ─────────────────────────────────────────────────────────────
+# ── Named volumes ──────────────────────────────────────────────────────────────
 volumes:
   kafka-1-data:
   kafka-2-data:
   kafka-3-data:
   minio-data:
-  postgres-data:
+  postgres-data:        # persists PostgreSQL data across container restarts
 
-# ── Network ───────────────────────────────────────────────────────────────────
+# ── Network ────────────────────────────────────────────────────────────────────
 networks:
   stocks-net:
     driver: bridge

@@ -1,5 +1,5 @@
 # ──────────────────────────────────────────────────────────────────────────────
-#  requirements.txt — M1 · Data & Kafka
+#  requirements.txt — M1 · Data & Kafka  +  PostgreSQL bulk loader
 #  Real-Time US Stocks Data Pipeline
 #
 #  Install:
@@ -27,3 +27,10 @@ kaggle==1.6.14
 
 # Progress bar (optional, nice for long downloads)
 tqdm==4.66.4
+
+# ── PostgreSQL bulk loader (bulk_load_to_postgres.py) ─────────────────────────
+# psycopg2-binary: pre-compiled PostgreSQL adapter — no build tools needed on Windows
+psycopg2-binary==2.9.9
+
+# SQLAlchemy: optional — only needed if you use pandas .to_sql() instead of COPY
+# sqlalchemy==2.0.30
