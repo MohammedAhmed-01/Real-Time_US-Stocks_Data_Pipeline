@@ -227,7 +227,7 @@ services:
   # Hub distribution, and still serving binaries as of April 2026 — inside
   # a plain alpine image, which is one of the most stable images on Docker Hub.
   minio-init:
-    image: alpine:3.20
+    image: elestio/minio:latest
     container_name: stocks-minio-init
     networks:
       - stocks-net
@@ -241,12 +241,14 @@ services:
     command:
       - |
         set -e
-        apk add --no-cache curl
-        curl -fL -o /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc
-        chmod +x /usr/local/bin/mc
+
+        echo "Setting MinIO alias..."
         mc alias set local http://minio:9000 \
           "$${MINIO_ACCESS_KEY}" "$${MINIO_SECRET_KEY}"
+
+        echo "Creating stocks bucket..."
         mc mb --ignore-existing local/stocks
+
         echo 'Bucket "stocks" is ready.'
     restart: "no"
 
