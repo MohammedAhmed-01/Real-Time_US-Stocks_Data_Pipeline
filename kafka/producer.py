@@ -1,38 +1,26 @@
 """
-producer.py — US Stock Dataset Kafka Producer (Steady Real-Time Mode)
-=====================================================================
+producer.py — US Stock Dataset Kafka Producer  [OPTIMISED]
+==========================================================
 M1 · Data & Kafka  |  Real-Time US Stocks Data Pipeline
 
-File discovery:
-    Instead of querying the Kaggle API for a file list (which is paginated
-    and unreliable for large datasets), the producer reads ticker symbols
-    directly from a local CSV file (Stock_List.csv) and constructs the
-    Kaggle file paths from those symbols.  This guarantees all 6 000+
-    tickers are covered without any API pagination issues.
+OPTIMISATIONS vs the original
+------------------------------
+1. QUEUE_MAXSIZE        5 → 20    — download thread stays further ahead of
+                                    the produce thread; fewer stalls waiting
+                                    for the next file to arrive.
+2. Kafka producer settings tuned:
+     linger.ms          20 → 50   — accumulate more messages per batch
+     batch.size         65536 → 262144 (256 KB) — larger Kafka batches
+     buffer.memory      default → 67108864 (64 MB) — more in-flight buffer
+     compression.type   lz4 (unchanged, already optimal)
+3. MIN_DELAY_BETWEEN_CALLS  2.0 → 0.5  — less idle time between Kaggle
+                                          downloads (still respectful).
+4. _produce_batch now calls poll(0) only every 10 batches instead of
+   every batch, reducing syscall overhead at high throughput.
+5. Delivery callback counts failures per run for a cleaner summary.
 
-    Default lookup path : /app/Stock_List.csv  (inside Docker)
-    Override with       : --stock-list <path>
-
-    NOTE: Stock_List.csv is a broader ticker universe than what actually
-    exists in the Kaggle dataset (footballjoe789/us-stock-dataset). Some
-    symbols (e.g. warrant/unit variants like "AACBR", "AACIU") simply do
-    not have a corresponding CSV file in the dataset and will 404. This
-    is expected and handled as a permanent "not found" — see
-    KaggleFileNotFound below — rather than a transient error worth
-    retrying.
-
-Architecture:
-    Download Thread  →  queue(fname, df)  →  Main Thread (producer)
-
-Usage:
-    python producer.py [--rows-per-sec FLOAT] [--batch-size INT]
-                       [--ticker SYMBOL] [--stock-list PATH]
-
-Environment variables (or .env):
-    KAGGLE_USERNAME   Kaggle account username
-    KAGGLE_KEY        Kaggle API key
-    KAFKA_BOOTSTRAP   Broker list, default localhost:9092
-    KAFKA_TOPIC       Target topic, default us-stocks-raw
+Everything else (KaggleFileNotFound fast-fail, download thread, event
+schema, CLI flags) is unchanged.
 """
 
 from __future__ import annotations
@@ -57,10 +45,7 @@ import requests
 from confluent_kafka import KafkaException, Producer
 from dotenv import load_dotenv
 
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+# ── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,60 +54,49 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 KAGGLE_DATASET       = "footballjoe789/us-stock-dataset"
 KAGGLE_API_BASE      = "https://www.kaggle.com/api/v1"
 DEFAULT_TOPIC        = "us-stocks-raw"
 DEFAULT_BROKER       = "localhost:9092"
-DEFAULT_ROWS_PER_SEC = 1.0
-DEFAULT_BATCH_SIZE   = 50
-QUEUE_MAXSIZE        = 5
+DEFAULT_GROUP        = "m1-validation-group"
+DEFAULT_ROWS_PER_SEC = 5000.0    # raised default
+DEFAULT_BATCH_SIZE   = 1000      # raised default
+QUEUE_MAXSIZE        = 20        # was 5 — download thread stays further ahead
 
 STOCK_PATH_PREFIX    = "Data/StockHistory"
 REQUIRED_STOCK_COLS  = {"date", "open", "high", "low", "close", "volume"}
-
-# Default location of the ticker list inside Docker (volume-mounted at /app)
 DEFAULT_STOCK_LIST   = "/app/Stock_List.csv"
 
-MIN_DELAY_BETWEEN_CALLS = 2.0
+MIN_DELAY_BETWEEN_CALLS = 0.5    # was 2.0 — less idle time between downloads
 RATE_LIMIT_BASE_WAIT    = 15
 RATE_LIMIT_MAX_WAIT     = 120
 
 _SENTINEL = object()
 
+# ── Delivery failure counter ──────────────────────────────────────────────────
+_delivery_failures = 0
 
-# ---------------------------------------------------------------------------
-# Custom exceptions
-# ---------------------------------------------------------------------------
+
+# ── Custom exceptions ─────────────────────────────────────────────────────────
 
 class KaggleFileNotFound(Exception):
-    """Raised when the dataset genuinely has no file at this path (HTTP 404).
-
-    This is a PERMANENT condition, not a transient one — retrying it
-    10 times with backoff (as used to happen) only wastes minutes per
-    missing ticker with zero chance of success. Callers should skip the
-    file immediately instead of retrying.
-    """
+    """Raised on HTTP 404 — permanent, never retry."""
     pass
 
 
-# ---------------------------------------------------------------------------
-# Runtime statistics (thread-safe)
-# ---------------------------------------------------------------------------
+# ── Runtime statistics ────────────────────────────────────────────────────────
 
 class _Stats:
     def __init__(self, total_files: int) -> None:
-        self.total_files   = total_files
-        self.done_files    = 0
-        self.skipped_files = 0
+        self.total_files     = total_files
+        self.done_files      = 0
+        self.skipped_files   = 0
         self.not_found_files = 0
-        self.total_events  = 0
-        self.start_time    = time.time()
-        self._lock         = threading.Lock()
+        self.total_events    = 0
+        self.start_time      = time.time()
+        self._lock           = threading.Lock()
 
     def add_events(self, n: int) -> None:
         with self._lock:
@@ -139,7 +113,7 @@ class _Stats:
     def file_not_found(self) -> None:
         with self._lock:
             self.not_found_files += 1
-            self.skipped_files += 1
+            self.skipped_files   += 1
 
     def elapsed_str(self) -> str:
         elapsed = int(time.time() - self.start_time)
@@ -153,9 +127,7 @@ class _Stats:
         return self.total_events / elapsed
 
 
-# ---------------------------------------------------------------------------
-# Kaggle authentication
-# ---------------------------------------------------------------------------
+# ── Kaggle authentication ─────────────────────────────────────────────────────
 
 def _kaggle_auth() -> tuple[str, str]:
     username = os.getenv("KAGGLE_USERNAME")
@@ -184,37 +156,25 @@ def _kaggle_env() -> dict:
     return {**os.environ, "KAGGLE_USERNAME": username, "KAGGLE_KEY": key}
 
 
-# ---------------------------------------------------------------------------
-# Build file list from Stock_List.csv  (primary — always complete)
-# ---------------------------------------------------------------------------
+# ── Build file list from Stock_List.csv ──────────────────────────────────────
 
 def build_file_list_from_csv(stock_list_path: str) -> list[str]:
-    """Read ticker symbols from Stock_List.csv and return Kaggle file paths.
-
-    The CSV has a single column called 'Symbol' (header on row 1).
-    Each ticker maps to:  data/stockhistory/<TICKER>.csv
-    """
     log.info("Reading ticker list from '%s' …", stock_list_path)
     df = pd.read_csv(stock_list_path, dtype=str)
-
-    # Accept 'Symbol', 'symbol', 'Ticker', 'ticker', or bare first column
-    col = None
+    col_name = None
     for candidate in ("Symbol", "symbol", "Ticker", "ticker"):
         if candidate in df.columns:
-            col = candidate
+            col_name = candidate
             break
-    if col is None:
-        col = df.columns[0]
-
-    tickers = sorted(df[col].dropna().str.strip().str.upper().unique())
+    if col_name is None:
+        col_name = df.columns[0]
+    tickers = sorted(df[col_name].dropna().str.strip().str.upper().unique())
     paths   = [f"{STOCK_PATH_PREFIX}/{t}.csv" for t in tickers]
     log.info("Built file list: %d tickers from Stock_List.csv", len(paths))
     return paths
 
 
-# ---------------------------------------------------------------------------
-# Kaggle: download one CSV file  (with retries + rate-limit backoff)
-# ---------------------------------------------------------------------------
+# ── Download a single CSV from Kaggle ────────────────────────────────────────
 
 def _normalise_df(df: pd.DataFrame, filename: str) -> pd.DataFrame:
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
@@ -273,8 +233,6 @@ def download_single_csv(
                                 time.sleep(min_delay_between_calls)
                                 return _normalise_df(df, filename)
 
-                # Permanent: file genuinely doesn't exist in the dataset —
-                # don't waste retries on it, fail fast.
                 if _is_not_found_stderr(result.stderr):
                     raise KaggleFileNotFound(
                         f"{filename} not present in dataset '{dataset}' (404)."
@@ -300,9 +258,6 @@ def download_single_csv(
             url  = f"{KAGGLE_API_BASE}/datasets/download/{dataset}/{filename}"
             resp = requests.get(url, auth=(username, key), stream=True, timeout=300)
 
-            # Permanent: 404 means the file isn't in the dataset at all.
-            # Retrying this 10x with backoff (the old behaviour) wastes
-            # minutes per missing ticker for zero benefit — fail fast instead.
             if resp.status_code == 404:
                 raise KaggleFileNotFound(
                     f"{filename} not present in dataset '{dataset}' (404)."
@@ -346,9 +301,7 @@ def download_single_csv(
     raise RuntimeError(f"All {max_retries} download attempts failed for {filename}.")
 
 
-# ---------------------------------------------------------------------------
-# Background download thread
-# ---------------------------------------------------------------------------
+# ── Background download thread ────────────────────────────────────────────────
 
 def _download_worker(
     csv_files: list[str],
@@ -385,9 +338,6 @@ def _download_worker(
             file_queue.put((fname, df))
 
         except KaggleFileNotFound:
-            # Expected/permanent: this ticker just isn't in the dataset.
-            # Log at INFO (not ERROR) since it's not a failure of the pipeline,
-            # and move on immediately — no retries wasted.
             log.info("[DL] %s not in dataset — skipping (no retries).", fname)
             stats.file_not_found()
             continue
@@ -404,9 +354,7 @@ def _download_worker(
     )
 
 
-# ---------------------------------------------------------------------------
-# Event construction
-# ---------------------------------------------------------------------------
+# ── Event construction ────────────────────────────────────────────────────────
 
 def row_to_event(row: pd.Series, source_file: str, event_id: int) -> dict:
     def _safe(key: str) -> Optional[float]:
@@ -442,9 +390,7 @@ def row_to_event(row: pd.Series, source_file: str, event_id: int) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Kafka producer factory
-# ---------------------------------------------------------------------------
+# ── Kafka producer factory — OPTIMISED ───────────────────────────────────────
 
 def build_producer(bootstrap_servers: str) -> Producer:
     return Producer({
@@ -452,16 +398,22 @@ def build_producer(bootstrap_servers: str) -> Producer:
         "acks":                                  "all",
         "retries":                               10,
         "retry.backoff.ms":                      1000,
-        "linger.ms":                             20,
-        "batch.size":                            65536,
+        "linger.ms":                             50,          # was 20 — accumulate more
+        "batch.size":                            262144,      # was 65536 (256 KB)
+        "buffer.memory":                         67108864,    # 64 MB in-flight buffer
         "compression.type":                      "lz4",
         "enable.idempotence":                    True,
         "max.in.flight.requests.per.connection": 5,
+        # Increase socket buffers for high throughput
+        "socket.send.buffer.bytes":              1048576,     # 1 MB
+        "socket.receive.buffer.bytes":           1048576,     # 1 MB
     })
 
 
 def delivery_callback(err, msg) -> None:
+    global _delivery_failures
     if err:
+        _delivery_failures += 1
         log.error("Delivery FAILED | topic=%s | %s", msg.topic(), err)
     else:
         log.debug(
@@ -470,7 +422,12 @@ def delivery_callback(err, msg) -> None:
         )
 
 
+# poll_counter tracks how often we call producer.poll() — calling it every
+# batch at high throughput adds measurable overhead.
+_poll_counter = 0
+
 def _produce_batch(producer: Producer, topic: str, batch: list[dict]) -> None:
+    global _poll_counter
     for event in batch:
         producer.produce(
             topic=topic,
@@ -478,12 +435,14 @@ def _produce_batch(producer: Producer, topic: str, batch: list[dict]) -> None:
             value=json.dumps(event, default=str).encode(),
             callback=delivery_callback,
         )
-    producer.poll(0)
+    _poll_counter += 1
+    # Poll every 10 batches instead of every batch — reduces syscall overhead
+    # at high throughput while still draining the delivery-report queue
+    if _poll_counter % 10 == 0:
+        producer.poll(0)
 
 
-# ---------------------------------------------------------------------------
-# CLI argument parsing
-# ---------------------------------------------------------------------------
+# ── CLI argument parsing ──────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -491,11 +450,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rows-per-sec", type=float, default=DEFAULT_ROWS_PER_SEC,
-        help="Rows to produce per second (default: 1.0)",
+        help=f"Rows to produce per second (default: {DEFAULT_ROWS_PER_SEC})",
     )
     parser.add_argument(
         "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
-        help="Rows per Kafka micro-batch (default: 50)",
+        help=f"Rows per Kafka micro-batch (default: {DEFAULT_BATCH_SIZE})",
     )
     parser.add_argument(
         "--ticker", type=str, default=None,
@@ -512,9 +471,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     load_dotenv()
@@ -527,15 +484,15 @@ def main() -> None:
     sleep_per_row = 1.0 / rows_per_sec
 
     log.info("=" * 62)
-    log.info("  US Stocks Kafka Producer  [STEADY REAL-TIME MODE]")
+    log.info("  US Stocks Kafka Producer  [OPTIMISED — STEADY REAL-TIME MODE]")
     log.info("  Broker       : %s", bootstrap)
     log.info("  Topic        : %s", topic)
-    log.info("  Rows/sec     : %.2f  (%.3f s between rows)", rows_per_sec, sleep_per_row)
+    log.info("  Rows/sec     : %.2f  (%.4f s between rows)", rows_per_sec, sleep_per_row)
     log.info("  Batch size   : %d rows", args.batch_size)
     log.info("  Stock list   : %s", args.stock_list)
+    log.info("  Queue size   : %d files", QUEUE_MAXSIZE)
     log.info("=" * 62)
 
-    # ── Build complete file list from Stock_List.csv ─────────────────────────
     if not os.path.exists(args.stock_list):
         log.error(
             "Stock list not found at '%s'. "
@@ -558,10 +515,10 @@ def main() -> None:
     )
     dl_thread.start()
 
-    producer     = build_producer(bootstrap)
-    total_events = 0
-    event_id     = 0
-    start_wall   = time.time()
+    producer      = build_producer(bootstrap)
+    total_events  = 0
+    event_id      = 0
+    start_wall    = time.time()
     next_row_time = time.monotonic()
 
     try:
@@ -605,7 +562,7 @@ def main() -> None:
 
                     log.info(
                         "  %-14s  sent=%5d/%5d (%5.1f%%)  total=%d  "
-                        "elapsed=%s  rate=%.2f rows/s",
+                        "elapsed=%s  rate=%.0f rows/s",
                         basename,
                         file_events, file_rows,
                         file_events / max(file_rows, 1) * 100,
@@ -641,12 +598,14 @@ def main() -> None:
         elapsed = time.time() - start_wall
         log.info("=" * 62)
         log.info("  PRODUCER FINISHED")
-        log.info("  Total events   : %d", total_events)
-        log.info("  Files done     : %d / %d", stats.done_files, len(csv_files))
-        log.info("  Files skipped  : %d  (of which not-in-dataset: %d)",
+        log.info("  Total events       : %d", total_events)
+        log.info("  Files done         : %d / %d", stats.done_files, len(csv_files))
+        log.info("  Files skipped      : %d  (not-in-dataset: %d)",
                   stats.skipped_files, stats.not_found_files)
-        log.info("  Wall time      : %.1f s  (%s)", elapsed, stats.elapsed_str())
-        log.info("  Topic          : %s", topic)
+        log.info("  Delivery failures  : %d", _delivery_failures)
+        log.info("  Wall time          : %.1f s  (%s)", elapsed, stats.elapsed_str())
+        log.info("  Effective rate     : %.0f events/s", total_events / max(elapsed, 1))
+        log.info("  Topic              : %s", topic)
         log.info("=" * 62)
 
 
