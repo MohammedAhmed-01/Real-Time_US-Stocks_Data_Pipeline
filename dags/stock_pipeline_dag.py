@@ -1,42 +1,80 @@
 """
-stock_pipeline_dag.py — M3/M4 Orchestration
-============================================
+stock_pipeline_dag.py — Full Pipeline Orchestration (M1 -> M2 -> M3 -> M4)
+============================================================================
 Real-Time US Stocks Data Pipeline
 
-Runs the full batch/orchestration leg of the pipeline end to end:
+Runs the ENTIRE pipeline end to end, in the order the data actually has to
+flow through the system:
 
-    1. check_kafka_health      Confirms the Kafka cluster (M1) is up and the
-                                expected topics exist, by execing into
-                                `kafka-1` and listing topics. Fails fast if
-                                M1 isn't running, instead of Spark failing
-                                later with a confusing connection error.
+    Kafka (M1)  -->  Spark Streaming (M2)  -->  MinIO (storage)
+                 -->  SparkSQL Analytics (M3)  -->  PostgreSQL (M3 sink)
 
-    2. check_postgres_health   Confirms the analytics Postgres (M3 sink) is
-                                reachable via a plain `SELECT 1`, before we
-                                spend minutes running Spark against it.
+Concretely, the DAG tasks are:
 
-    3. spark_analytics_job     spark-submit analytics_job.py inside the
-                                already-running `stocks-spark` container.
-                                Reads clean Parquet from MinIO, writes 9
-                                insight tables to Postgres via JDBC.
+    1. check_kafka_health       Confirms the Kafka cluster (M1) is up and the
+                                 expected topics exist, by execing into
+                                 `kafka-1` and listing topics. Fails fast if
+                                 M1 isn't running, instead of Spark failing
+                                 later with a confusing connection error.
 
-    4. load_post_analytics_sql Runs post_analytics.sql (psql, not plain SQL —
-                                it uses \\echo meta-commands) inside the
-                                `stocks-postgres` container to restore the
-                                indexes/views that Spark's JDBC
-                                mode="overwrite" drops on every run.
+    2. check_postgres_health    Confirms the analytics Postgres (M3 sink) is
+                                 reachable via a plain `SELECT 1`, before we
+                                 spend minutes running Spark against it.
 
-    5. validate_data           Row-count sanity check on every table
-                                analytics_job.py is supposed to have written.
-                                Fails the DAG run if any table is empty.
+    3. run_spark_streaming_job  Runs streaming_job.py (M2) inside the
+                                 already-running `stocks-spark` container.
+                                 This is the step that actually reads from
+                                 Kafka, validates events, and writes clean +
+                                 windowed Parquet into MinIO. THIS WAS
+                                 MISSING FROM THE ORIGINAL DAG — analytics_job
+                                 was being run directly against whatever
+                                 (possibly stale, possibly empty) data
+                                 happened to already be sitting in MinIO.
+
+                                 streaming_job.py is a Structured Streaming
+                                 job and blocks forever (awaitAnyTermination).
+                                 Since this DAG's job is a scheduled BATCH run
+                                 (not an always-on service), the job is
+                                 wrapped in `timeout <N>s` so it drains Kafka
+                                 into MinIO for a bounded window and then
+                                 stops cleanly. Exit codes 124/143 (timeout's
+                                 own SIGTERM) are treated as success, not
+                                 failure — see STREAMING_RUN_SECONDS below to
+                                 tune the window.
+
+    4. check_minio_data         Confirms streaming_job.py actually produced
+                                 clean Parquet in MinIO (s3a://stocks/clean)
+                                 before we hand off to Spark analytics. Execs
+                                 into the `stocks-minio` container (same
+                                 image as minio-init, so `mc` is already
+                                 there) and lists the clean/ prefix. Fails
+                                 the DAG early — with a clear message — if
+                                 MinIO is empty, instead of analytics_job.py
+                                 silently succeeding with 0 rows everywhere.
+
+    5. spark_analytics_job      spark-submit analytics_job.py (M3) inside
+                                 `stocks-spark`. Reads clean Parquet from
+                                 MinIO, writes 9-10 insight tables to
+                                 Postgres via JDBC.
+
+    6. load_post_analytics_sql  Runs post_analytics.sql (psql, not plain SQL
+                                 — it uses \\echo meta-commands) inside the
+                                 `stocks-postgres` container to restore the
+                                 indexes/views that Spark's JDBC
+                                 mode="overwrite" drops on every run.
+
+    7. validate_data            Row-count sanity check on every table
+                                 analytics_job.py is supposed to have
+                                 written. Fails the DAG run if any table is
+                                 empty.
 
 DESIGN NOTE — why "docker exec" instead of DockerOperator / SparkSubmitOperator
 --------------------------------------------------------------------------------
-`stocks-spark` and `stocks-postgres` are already long-running services in
-docker-compose.yml with all the right JARs, env vars, and volumes baked in.
-Rather than have Airflow spin up *new* containers (which, over the Docker
-socket from inside another container, needs host-absolute volume paths and
-duplicates config), each task execs into the existing service container —
+`stocks-spark`, `stocks-minio`, and `stocks-postgres` are already long-running
+services in docker-compose.yml with all the right JARs, env vars, and volumes
+baked in. Rather than have Airflow spin up *new* containers (which, over the
+Docker socket from inside another container, needs host-absolute volume paths
+and duplicates config), each task execs into the existing service container —
 exactly what a human would type at the terminal, just automated. Airflow's
 job here is orchestration/scheduling/retries, not re-implementing Spark.
 
@@ -48,8 +86,9 @@ airflow/requirements-airflow.txt).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
+import pendulum
 import docker
 from docker.errors import NotFound
 
@@ -65,6 +104,7 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 SPARK_CONTAINER = "stocks-spark"
+MINIO_CONTAINER = "stocks-minio"
 POSTGRES_CONTAINER = "stocks-postgres"
 KAFKA_CONTAINER = "kafka-1"
 KAFKA_BOOTSTRAP = "kafka-1:29092"
@@ -72,6 +112,20 @@ POSTGRES_CONN_ID = "stocks_postgres"  # auto-registered via AIRFLOW_CONN_STOCKS_
 
 # Topics kafka-init creates on stack startup — see docker-compose.yml
 EXPECTED_TOPICS = ["us-stocks-raw", "us-stocks-dead-letter"]
+
+# How long to let the Spark Structured Streaming job (M2) drain Kafka into
+# MinIO before this batch DAG run moves on to analytics. Structured Streaming
+# jobs run forever by design, so a scheduled batch DAG has to bound this
+# somehow. Kept under the 5-minute run cadence (see `schedule` below) so
+# there's still time left in each cycle for the MinIO check, SparkSQL
+# analytics, indexing, and validation steps before the next run is due.
+STREAMING_RUN_SECONDS = 180
+
+# `timeout` exits 124 when it kills the process via SIGTERM after the given
+# duration, and shells commonly report 143 (128+SIGTERM) if the underlying
+# process itself surfaces the termination signal as its exit status. Both
+# are the EXPECTED way this task ends — not a failure.
+EXPECTED_TIMEOUT_EXIT_CODES = {124, 143}
 
 # Every table analytics_job.py writes on a normal run (streaming_window_summary
 # is intentionally excluded — it's conditional on live streaming data existing).
@@ -87,8 +141,20 @@ EXPECTED_TABLES = [
     "daily_market_breadth",
 ]
 
+# ── M2: Spark Structured Streaming (Kafka -> MinIO) ───────────────────────────
+# Bounded with `timeout` — see STREAMING_RUN_SECONDS above.
+SPARK_STREAMING_CMD = """
+timeout {timeout}s /opt/spark/bin/spark-submit \
+  --master spark://stocks-spark:7077 \
+  --conf spark.jars.ivy=/tmp/.ivy2 \
+  /opt/spark/work-dir/streaming_job.py
+echo "__EXIT_CODE__:$?"
+""".strip()
+
+# ── M3: SparkSQL Analytics (MinIO -> Postgres) ────────────────────────────────
 SPARK_SUBMIT_CMD = """
-spark-submit \
+set -e
+/opt/spark/bin/spark-submit \
   --master local[4] \
   --conf spark.jars.ivy=/tmp/.ivy2 \
   --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
@@ -105,14 +171,29 @@ POST_ANALYTICS_CMD = (
     "psql -U $POSTGRES_USER -d $POSTGRES_DB -f /opt/sql/post_analytics.sql"
 )
 
+# ── MinIO check — list objects under clean/ via mc (same image as minio-init) ─
+MINIO_CHECK_CMD = """
+set -e
+mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 \
+  || mc alias set local http://minio:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY" >/dev/null 2>&1
+mc ls --recursive local/stocks/clean/ | wc -l
+""".strip()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helper — run a command inside an already-running container
 # ─────────────────────────────────────────────────────────────────────────────
-def _exec_in_container(container_name: str, shell_command: str) -> str:
+def _exec_in_container(
+    container_name: str,
+    shell_command: str,
+    allowed_exit_codes: set[int] | None = None,
+) -> str:
     """Run `shell_command` via `bash -c` inside `container_name`, return its
     combined stdout/stderr as text, and raise AirflowException (→ Airflow
-    retry) if it exits non-zero."""
+    retry) if it exits with a code not in `allowed_exit_codes` (default:
+    only 0 is allowed)."""
+    allowed = allowed_exit_codes or {0}
+
     client = docker.from_env()
     try:
         container = client.containers.get(container_name)
@@ -127,9 +208,10 @@ def _exec_in_container(container_name: str, shell_command: str) -> str:
     text = output.decode(errors="replace")
     log.info(text)
 
-    if exit_code != 0:
+    if exit_code not in allowed:
         raise AirflowException(
-            f"Command in container '{container_name}' failed with exit code {exit_code}"
+            f"Command in container '{container_name}' failed with exit code "
+            f"{exit_code} (allowed: {sorted(allowed)})"
         )
     return text
 
@@ -153,12 +235,46 @@ def check_kafka_health(**_context) -> None:
 
 def check_postgres_health(**_context) -> None:
     """M3 pre-flight check: analytics Postgres is reachable before we spend
-    minutes running the Spark job against it."""
+    minutes running Spark against it."""
     hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
     result = hook.get_first("SELECT 1;")
     if not result or result[0] != 1:
         raise AirflowException("Postgres health check returned an unexpected result.")
     log.info("Postgres healthy (SELECT 1 succeeded).")
+
+
+def run_spark_streaming_job(**_context) -> None:
+    """M2: Kafka -> MinIO. Bounded by `timeout` since Structured Streaming
+    jobs otherwise run forever. A timeout-induced exit is success, not
+    failure — it means the job drained Kafka into MinIO for the configured
+    window and was then stopped on schedule."""
+    cmd = SPARK_STREAMING_CMD.format(timeout=STREAMING_RUN_SECONDS)
+    # 0 = job exited on its own before the timeout (e.g. Kafka topic was
+    #     fully drained and idle); 124/143 = expected timeout termination.
+    _exec_in_container(
+        SPARK_CONTAINER,
+        cmd,
+        allowed_exit_codes={0, *EXPECTED_TIMEOUT_EXIT_CODES},
+    )
+
+
+def check_minio_data(**_context) -> None:
+    """Confirms streaming_job.py actually wrote clean Parquet to MinIO
+    before analytics_job.py reads from it. Prevents a silent 0-row
+    analytics run from looking like a successful DAG."""
+    output = _exec_in_container(MINIO_CONTAINER, MINIO_CHECK_CMD)
+    try:
+        object_count = int(output.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        object_count = 0
+
+    log.info("MinIO s3a://stocks/clean/ object count: %d", object_count)
+    if object_count == 0:
+        raise AirflowException(
+            "MinIO has no objects under s3a://stocks/clean/ after the "
+            "streaming job ran. Check that Kafka actually had events to "
+            "consume, and check `docker compose logs spark-worker`."
+        )
 
 
 def run_spark_analytics(**_context) -> None:
@@ -202,24 +318,46 @@ def validate_data(**_context) -> None:
 default_args = {
     "owner": "data-eng",
     "retries": 2,
-    "retry_delay": timedelta(minutes=5),
-    # SLA: if the whole run isn't done in 45 min, Airflow marks it as an SLA
+    "retry_delay": timedelta(minutes=1),
+    # SLA: if the whole run isn't done in 4.5 min, Airflow marks it as an SLA
     # miss (visible in the UI / sendable to Slack/email) without failing the
-    # run outright — the numbers here are a starting point that the team
-    # should tune once we know real Spark job durations on your hardware.
-    "sla": timedelta(minutes=45),
+    # run outright. Kept just under the 5-minute schedule interval so a slow
+    # run is flagged before the next one is even due — tune this once you
+    # know real Spark job durations on your hardware.
+    "sla": timedelta(minutes=4, seconds=30),
 }
 
 with DAG(
     dag_id="stock_analytics_pipeline",
-    description="Kafka health -> Postgres health -> SparkSQL analytics -> Postgres load/index -> validation",
+    description=(
+        "Kafka health -> Postgres health -> Spark Streaming (Kafka->MinIO) "
+        "-> MinIO data check -> SparkSQL analytics (MinIO->Postgres) "
+        "-> Postgres load/index -> validation. "
+        "Runs every 5 minutes starting 3:00 PM Africa/Cairo time."
+    ),
     default_args=default_args,
-    schedule="0 6 * * *",       # daily 06:00 UTC — change to suit your data refresh cadence
-    start_date=datetime(2026, 1, 1),
+    # Every 5 minutes, anchored to the Africa/Cairo timezone (handles EET/EEST
+    # DST switches automatically via the IANA tz database — no manual offset
+    # math needed). start_date's time-of-day (15:00) is just the anchor point
+    # cron intervals are calculated from; with catchup=False the first actual
+    # run fires at the next 5-minute mark after the DAG is unpaused, and every
+    # 5 minutes after that, day after day.
+    schedule="*/5 * * * *",
+    start_date=pendulum.datetime(2026, 1, 1, 15, 0, tz="Africa/Cairo"),
     catchup=False,
-    dagrun_timeout=timedelta(hours=1),
-    max_active_runs=1,          # never let two analytics runs overlap
-    tags=["m1", "m3", "kafka", "spark", "postgres"],
+    dagrun_timeout=timedelta(minutes=5),
+    max_active_runs=1,          # never let two pipeline runs overlap — if a
+                                 # run takes longer than 5 min, the next one
+                                 # queues behind it instead of running in
+                                 # parallel.
+    tags=[
+        "US Stocks Pipeline",
+        "1. Kafka - Ingest",
+        "2. Spark Streaming - Process",
+        "3. MinIO - Store",
+        "4. SparkSQL - Analyze",
+        "5. PostgreSQL - Serve",
+    ],
 ) as dag:
 
     check_kafka = PythonOperator(
@@ -230,6 +368,17 @@ with DAG(
     check_postgres = PythonOperator(
         task_id="check_postgres_health",
         python_callable=check_postgres_health,
+    )
+
+    spark_streaming_job = PythonOperator(
+        task_id="run_spark_streaming_job",
+        python_callable=run_spark_streaming_job,
+        execution_timeout=timedelta(seconds=STREAMING_RUN_SECONDS + 120),
+    )
+
+    minio_check = PythonOperator(
+        task_id="check_minio_data",
+        python_callable=check_minio_data,
     )
 
     spark_analytics_job = PythonOperator(
@@ -247,4 +396,6 @@ with DAG(
         python_callable=validate_data,
     )
 
-    [check_kafka, check_postgres] >> spark_analytics_job >> load_post_analytics_sql >> validate
+    # Kafka -> Spark Streaming -> MinIO -> SparkSQL Analytics -> Postgres
+    [check_kafka, check_postgres] >> spark_streaming_job >> minio_check \
+        >> spark_analytics_job >> load_post_analytics_sql >> validate
