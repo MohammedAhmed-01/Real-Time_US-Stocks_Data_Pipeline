@@ -225,6 +225,6 @@ docker exec -it airflow-webserver cat /opt/airflow/dags/stock_pipeline_dag.py
 ## 🔗 Related Docs
 
 - `PIPELINE_QUICKSTART.md` — full manual run-through of every pipeline stage without Airflow
-- `spark/README.md` — Spark Streaming (M2) details
-- `SparkSQL/README.md` — SparkSQL Analytics (M3) details
+- `spark/README.md` — Spark Streaming details
+- `SparkSQL/README.md` — SparkSQL Analytics details
 - `PostgresSQL/README.md` — PostgreSQL setup, schema, and Power BI connection
