@@ -17,6 +17,11 @@
 #  Spark Master   : http://localhost:8081
 #  Kafka UI       : http://localhost:8080
 #  PostgreSQL     : localhost:5432  (stocks / stocks123)
+#  pgAdmin        : http://localhost:5050  (admin@stocks.com / admin123)
+#  Airflow UI     : http://localhost:8082  (admin / admin — set in .env)
+#
+#  All credentials above are the .env defaults (see env.example) — override
+#  them in your own .env before deploying anywhere beyond localhost.
 ##############################################################################
 
 services:
@@ -270,6 +275,9 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./spark/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Mounted (not run at initdb time) so the Airflow DAG can `docker exec`
+      # + `psql -f` this on-demand after every analytics_job.py run.
+      - ./spark/post_analytics.sql:/opt/sql/post_analytics.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stocks} -d ${POSTGRES_DB:-stocks_analytics}"]
       interval: 10s
@@ -443,18 +451,123 @@ services:
     ports:
       - "5050:80"
     environment:
-      PGADMIN_DEFAULT_EMAIL:    admin@stocks.com
-      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_DEFAULT_EMAIL:    ${PGADMIN_DEFAULT_EMAIL:-admin@stocks.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin123}
     depends_on:
       postgres:
         condition: service_healthy
+
+  # ── Airflow metadata DB (kept separate from the analytics `postgres`
+  #    service above so DAG runs/task history never mix with business data) ──
+  postgres-airflow:
+    image: postgres:16
+    container_name: airflow-postgres
+    restart: unless-stopped
+    networks:
+      - stocks-net
+    environment:
+      POSTGRES_DB:       airflow
+      POSTGRES_USER:     airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── One-shot: migrate the metadata DB + create the admin user, then exit ──
+  airflow-init:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    image: stocks-airflow:2.10.4
+    container_name: airflow-init
+    networks:
+      - stocks-net
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+    environment: &airflow-common-env
+      AIRFLOW__CORE__EXECUTOR:              LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:  postgresql+psycopg2://airflow:airflow@postgres-airflow/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES:         "false"
+      AIRFLOW__CORE__DEFAULT_TIMEZONE:      utc
+      AIRFLOW__WEBSERVER__SECRET_KEY:       ${AIRFLOW_SECRET_KEY:-please-change-me-in-.env}
+      # Connection used by the DAG's Postgres tasks (SQLExecuteQueryOperator /
+      # PostgresHook auto-detect connections from AIRFLOW_CONN_* env vars —
+      # no manual setup in the Airflow UI needed).
+      AIRFLOW_CONN_STOCKS_POSTGRES: postgresql://${POSTGRES_USER:-stocks}:${POSTGRES_PASSWORD:-stocks123}@postgres:5432/${POSTGRES_DB:-stocks_analytics}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-admin}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@stocks.com \
+          || echo "Admin user already exists, skipping."
+    restart: "no"
+
+  airflow-webserver:
+    image: stocks-airflow:2.10.4
+    container_name: airflow-webserver
+    restart: unless-stopped
+    user: "0:0"   # root — required so this container can reach the host's
+                  # /var/run/docker.sock and exec into stocks-spark (DooD).
+    networks:
+      - stocks-net
+    ports:
+      - "8082:8080"   # 8080 = kafka-ui, 8081 = Spark UI, so Airflow gets 8082
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/opt/airflow/project:ro   # read-only access to spark/, PostgresSQL/, etc.
+    command: ["airflow", "webserver"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  airflow-scheduler:
+    image: stocks-airflow:2.10.4
+    container_name: airflow-scheduler
+    restart: unless-stopped
+    user: "0:0"   # same DooD reasoning as airflow-webserver
+    networks:
+      - stocks-net
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/opt/airflow/project:ro
+    command: ["airflow", "scheduler"]
+
 # ── Named volumes ──────────────────────────────────────────────────────────────
 volumes:
   kafka-1-data:
   kafka-2-data:
   kafka-3-data:
   minio-data:
-  postgres-data:        # persists PostgreSQL data across container restarts
+  postgres-data:          # persists PostgreSQL data across container restarts
+  airflow-postgres-data:  # persists Airflow's metadata DB (DAG/task history)
 
 # ── Network ────────────────────────────────────────────────────────────────────
 networks:

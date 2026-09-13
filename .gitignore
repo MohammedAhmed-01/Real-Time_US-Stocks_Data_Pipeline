@@ -45,3 +45,9 @@ Thumbs.db
 
 # Docker
 docker-data/
+
+# Airflow
+airflow/logs/*
+!airflow/logs/.gitkeep
+airflow/plugins/*
+!airflow/plugins/.gitkeep
