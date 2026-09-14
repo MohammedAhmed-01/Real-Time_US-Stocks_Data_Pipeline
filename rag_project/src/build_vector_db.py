@@ -1,108 +1,203 @@
-"""
-build_vector_db.py
-===================
-Builds the local vector knowledge base from source CSV files. Pipeline:
+import pandas as pd
 
-    1. Read source CSV files (stock prices + ML predictions)
-    2. Convert each row into a natural-language sentence (text_converter.py)
-    3. Group sentences into chunks (simple fixed-size grouping)
-    4. Generate embeddings for each chunk (sentence-transformers)
-    5. Persist chunks + embeddings to ChromaDB on disk (chroma_db/)
-
-Usage
------
-    python src/build_vector_db.py
-
-Run this once whenever the source data changes, before starting the
-Streamlit app. The resulting chroma_db/ directory is what the app queries
-at runtime.
-"""
-
-from __future__ import annotations
-
-import os
-
-import chromadb
-from sentence_transformers import SentenceTransformer
-
-from text_converter import csv_to_documents
 
 # ============================================================
-# Configuration — adjust paths/settings as needed
+# Column mapping
 # ============================================================
-STOCK_CSV_PATH = "data/sample_stock_data.csv"
-PREDICTIONS_CSV_PATH = "data/sample_predictions.csv"  # optional
-CHROMA_DB_PATH = "chroma_db"
-COLLECTION_NAME = "stocks_knowledge_base"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
-# Number of sentences grouped into a single chunk (richer context per chunk)
-CHUNK_SIZE = 5
-
-
-def make_chunks(documents: list[str], chunk_size: int = CHUNK_SIZE) -> list[str]:
-    """Group every `chunk_size` sentences into a single chunk of text."""
-    chunks = []
-    for i in range(0, len(documents), chunk_size):
-        group = documents[i : i + chunk_size]
-        chunks.append(" ".join(group))
-    return chunks
+STOCK_COLUMN_MAP = {
+    "date": "Date",
+    "open": "Open",
+    "high": "High",
+    "low": "Low",
+    "close": "Close",
+    "volume": "Volume",
+}
 
 
-def build_database() -> None:
-    print("[1/6] Loading the embedding model (downloads once, then cached)...")
-    embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
+# ============================================================
+# Find column
+# ============================================================
 
-    all_documents: list[str] = []
+def _find_column(df: pd.DataFrame, wanted: str) -> str:
 
-    # -- Stock price data --
-    if os.path.exists(STOCK_CSV_PATH):
-        print(f"[2/6] Converting stock price data from '{STOCK_CSV_PATH}'...")
-        stock_docs = csv_to_documents(STOCK_CSV_PATH, row_type="stock")
-        all_documents.extend(stock_docs)
-        print(f"      Converted {len(stock_docs)} rows.")
-    else:
-        print(f"      WARNING: '{STOCK_CSV_PATH}' not found — skipping.")
+    if wanted in df.columns:
+        return wanted
 
-    # -- ML prediction data (optional) --
-    if os.path.exists(PREDICTIONS_CSV_PATH):
-        print(f"[3/6] Converting prediction data from '{PREDICTIONS_CSV_PATH}'...")
-        pred_docs = csv_to_documents(PREDICTIONS_CSV_PATH, row_type="prediction")
-        all_documents.extend(pred_docs)
-        print(f"      Converted {len(pred_docs)} rows.")
-    else:
-        print(f"      NOTE: '{PREDICTIONS_CSV_PATH}' not found yet — skipping for now.")
+    lowered = {
+        str(c).lower(): c
+        for c in df.columns
+    }
 
-    if not all_documents:
-        print("No documents were generated. Check that your CSV files exist in data/.")
-        return
+    if wanted.lower() in lowered:
+        return lowered[wanted.lower()]
 
-    print(f"[4/6] Chunking {len(all_documents)} sentences (group size = {CHUNK_SIZE})...")
-    chunks = make_chunks(all_documents)
-    print(f"      Total chunks: {len(chunks)}")
-
-    print("[5/6] Generating embeddings for all chunks (may take a moment)...")
-    embeddings = embedder.encode(chunks, show_progress_bar=True).tolist()
-
-    print("[6/6] Persisting chunks + embeddings to ChromaDB...")
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-
-    # Drop any existing collection first to avoid duplicate entries on rebuild
-    try:
-        client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
-
-    collection = client.create_collection(COLLECTION_NAME)
-    collection.add(
-        documents=chunks,
-        embeddings=embeddings,
-        ids=[f"chunk_{i}" for i in range(len(chunks))],
+    raise KeyError(
+        f"Column '{wanted}' not found. "
+        f"Available columns: {list(df.columns)}"
     )
 
-    print(f"\nDone. Vector database saved to '{CHROMA_DB_PATH}/'")
-    print(f"Chunks stored: {len(chunks)}")
+
+# ============================================================
+# Stock row → text
+# ============================================================
+
+def stock_row_to_text(
+    row: pd.Series,
+    ticker: str,
+    column_map: dict = STOCK_COLUMN_MAP
+) -> str:
+
+    c = column_map
+
+    return (
+        f"On {row[c['date']]}, "
+        f"{ticker} stock opened at "
+        f"${float(row[c['open']]):.2f}, "
+        f"reached a high of "
+        f"${float(row[c['high']]):.2f} "
+        f"and a low of "
+        f"${float(row[c['low']]):.2f}, "
+        f"and closed at "
+        f"${float(row[c['close']]):.2f}, "
+        f"with a trading volume of "
+        f"{int(row[c['volume']]):,} shares."
+    )
 
 
-if __name__ == "__main__":
-    build_database()
+# ============================================================
+# Generic row → text
+# ============================================================
+
+def generic_row_to_text(
+    row: pd.Series,
+    label: str
+) -> str:
+
+    parts = []
+
+    for col, val in row.items():
+
+        if pd.isna(val):
+            continue
+
+        clean_col = (
+            str(col)
+            .replace("_", " ")
+            .strip()
+        )
+
+        parts.append(
+            f"{clean_col}: {val}"
+        )
+
+    return (
+        f"{label} record — "
+        + ", ".join(parts)
+        + "."
+    )
+
+
+# ============================================================
+# Stock CSV → documents
+# ============================================================
+
+def stock_csv_to_documents(
+    csv_path: str,
+    ticker: str,
+    years_back: int | None = None
+) -> list[str]:
+
+    print(f"Reading: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+
+    print(
+        f"{ticker}: "
+        f"{len(df):,} rows loaded"
+    )
+
+    date_col = _find_column(
+        df,
+        STOCK_COLUMN_MAP["date"]
+    )
+
+    df[date_col] = pd.to_datetime(
+        df[date_col],
+        errors="coerce"
+    )
+
+    df = df.dropna(
+        subset=[date_col]
+    )
+
+    if years_back is not None and not df.empty:
+
+        cutoff = (
+            df[date_col].max()
+            - pd.DateOffset(years=years_back)
+        )
+
+        df = df[
+            df[date_col] >= cutoff
+        ]
+
+        print(
+            f"{ticker}: "
+            f"{len(df):,} rows after "
+            f"{years_back}-year filter"
+        )
+
+    documents = []
+
+    for _, row in df.iterrows():
+
+        try:
+
+            text = stock_row_to_text(
+                row,
+                ticker
+            )
+
+            documents.append(text)
+
+        except Exception as e:
+
+            print(
+                f"WARNING: Failed to convert "
+                f"{ticker} row: {e}"
+            )
+
+    return documents
+
+
+# ============================================================
+# Generic CSV → documents
+# ============================================================
+
+def generic_csv_to_documents(
+    csv_path: str,
+    label: str
+) -> list[str]:
+
+    print(f"Reading: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+
+    print(
+        f"{label}: "
+        f"{len(df):,} rows loaded"
+    )
+
+    documents = []
+
+    for _, row in df.iterrows():
+
+        text = generic_row_to_text(
+            row,
+            label
+        )
+
+        documents.append(text)
+
+    return documents
