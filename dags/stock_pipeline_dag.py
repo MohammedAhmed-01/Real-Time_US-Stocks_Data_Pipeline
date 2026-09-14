@@ -444,13 +444,23 @@ with DAG(
         "Runs every 7 minutes."
     ),
     default_args=default_args,
+<<<<<<< HEAD
     # Fires exactly every 7 minutes from the last run's start, regardless of
     # clock time. (Cron's */7 does NOT divide evenly into 60 minutes, so it
     # would produce an irregular gap once per hour — a timedelta avoids that.)
     schedule=timedelta(minutes=7),
+=======
+    # Every 5 minutes, anchored to the Africa/Cairo timezone (handles EET/EEST
+    # DST switches automatically via the IANA tz database — no manual offset
+    # math needed). start_date's time-of-day (15:00) is just the anchor point
+    # cron intervals are calculated from; with catchup=False the first actual
+    # run fires at the next 5-minute mark after the DAG is unpaused, and every
+    # 5 minutes after that, day after day.
+    schedule="*/5 * * * *",
+>>>>>>> c0f203ad803863772c33a7edc7575a049839624a
     start_date=pendulum.datetime(2026, 1, 1, 15, 0, tz="Africa/Cairo"),
     catchup=False,
-    dagrun_timeout=timedelta(minutes=10),
+    dagrun_timeout=timedelta(minutes=5),
     max_active_runs=1,          # never let two pipeline runs overlap — if a
                                  # run takes longer than 7 min, the next one
                                  # queues behind it instead of running in
