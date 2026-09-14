@@ -119,7 +119,7 @@ EXPECTED_TOPICS = ["us-stocks-raw", "us-stocks-dead-letter"]
 # somehow. Kept under the 5-minute run cadence (see `schedule` below) so
 # there's still time left in each cycle for the MinIO check, SparkSQL
 # analytics, indexing, and validation steps before the next run is due.
-STREAMING_RUN_SECONDS = 120
+STREAMING_RUN_SECONDS = 180
 
 # `timeout` exits 124 when it kills the process via SIGTERM after the given
 # duration, and shells commonly report 143 (128+SIGTERM) if the underlying
@@ -319,7 +319,12 @@ default_args = {
     "owner": "data-eng",
     "retries": 2,
     "retry_delay": timedelta(minutes=1),
-    "sla": timedelta(minutes=19),   # warn before the dagrun_timeout fires
+    # SLA: if the whole run isn't done in 4.5 min, Airflow marks it as an SLA
+    # miss (visible in the UI / sendable to Slack/email) without failing the
+    # run outright. Kept just under the 5-minute schedule interval so a slow
+    # run is flagged before the next one is even due — tune this once you
+    # know real Spark job durations on your hardware.
+    "sla": timedelta(minutes=4, seconds=30),
 }
 
 with DAG(
@@ -328,7 +333,7 @@ with DAG(
         "Kafka health -> Postgres health -> Spark Streaming (Kafka->MinIO) "
         "-> MinIO data check -> SparkSQL analytics (MinIO->Postgres) "
         "-> Postgres load/index -> validation. "
-        "Runs every 10 minutes starting 3:00 PM Africa/Cairo time."
+        "Runs every 5 minutes starting 3:00 PM Africa/Cairo time."
     ),
     default_args=default_args,
     # Every 5 minutes, anchored to the Africa/Cairo timezone (handles EET/EEST
@@ -337,10 +342,10 @@ with DAG(
     # cron intervals are calculated from; with catchup=False the first actual
     # run fires at the next 5-minute mark after the DAG is unpaused, and every
     # 5 minutes after that, day after day.
-    schedule="*/10 * * * *",
+    schedule="*/5 * * * *",
     start_date=pendulum.datetime(2026, 1, 1, 15, 0, tz="Africa/Cairo"),
     catchup=False,
-    dagrun_timeout=timedelta(minutes=10),
+    dagrun_timeout=timedelta(minutes=5),
     max_active_runs=1,          # never let two pipeline runs overlap — if a
                                  # run takes longer than 5 min, the next one
                                  # queues behind it instead of running in
