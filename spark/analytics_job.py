@@ -179,7 +179,10 @@ def _jdbc_execute(sql: str) -> None:
     """Run arbitrary SQL against PostgreSQL via the JDBC driver already on the
     Spark classpath.  Uses py4j's Java gateway — no extra Python libraries needed.
     """
-    driver_manager = spark._sc._gateway.jvm.java.sql.DriverManager
+    # DriverManager does not reliably discover application jars from the
+    # Py4J gateway until the PostgreSQL driver class is explicitly loaded.
+    spark._jvm.java.lang.Class.forName("org.postgresql.Driver")
+    driver_manager = spark._jvm.java.sql.DriverManager
     conn = driver_manager.getConnection(JDBC_URL, PG_USER, PG_PASSWORD)
     conn.setAutoCommit(True)
     stmt = conn.createStatement()
@@ -199,11 +202,8 @@ def drop_views() -> None:
     """
     log.info("Dropping dependent views (if they exist) …")
     for view in _VIEWS_TO_DROP:
-        try:
-            _jdbc_execute(f"DROP VIEW IF EXISTS {view} CASCADE;")
-            log.info("  dropped view %s", view)
-        except Exception as exc:
-            log.warning("  could not drop view %s: %s", view, exc)
+        _jdbc_execute(f"DROP VIEW IF EXISTS {view} CASCADE;")
+        log.info("  dropped view %s", view)
     log.info("Views cleared — table overwrites are now safe.")
 
 
@@ -238,6 +238,7 @@ def run_insight(label: str, sql: str, table: str) -> None:
         )
     except Exception as exc:
         log.error("  ✗  %s FAILED: %s", label, exc)
+        raise RuntimeError(f"Analytics insight '{label}' failed") from exc
 
 
 # ──────────────────────────────────────────────────────────────────────────────

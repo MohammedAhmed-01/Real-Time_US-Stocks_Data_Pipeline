@@ -192,7 +192,9 @@ timeout {timeout}s /opt/spark/bin/spark-submit \
   --master spark://stocks-spark:7077 \
   --conf spark.jars.ivy=/tmp/.ivy2 \
   /opt/spark/work-dir/streaming_job.py
-echo "__EXIT_CODE__:$?"
+exit_code=$?
+echo "__EXIT_CODE__:$exit_code"
+exit "$exit_code"
 """.strip()
 
 # ── M3: SparkSQL Analytics (MinIO -> Postgres) ────────────────────────────────
@@ -201,18 +203,13 @@ set -e
 /opt/spark/bin/spark-submit \
   --master local[4] \
   --conf spark.jars.ivy=/tmp/.ivy2 \
-  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
-  --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
-  --conf spark.hadoop.fs.s3a.path.style.access=true \
-  --conf spark.hadoop.fs.s3a.access.key=$MINIO_ACCESS_KEY \
-  --conf spark.hadoop.fs.s3a.secret.key=$MINIO_SECRET_KEY \
-  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
-  --conf spark.sql.files.ignoreMissingFiles=true \
   /opt/spark/work-dir/analytics_job.py
 """.strip()
 
 POST_ANALYTICS_CMD = (
-    "psql -U $POSTGRES_USER -d $POSTGRES_DB -f /opt/sql/post_analytics.sql"
+        "PGPASSWORD=\"$POSTGRES_PASSWORD\" "
+        "psql -v ON_ERROR_STOP=1 -U \"$POSTGRES_USER\" "
+        "-d \"$POSTGRES_DB\" -f /opt/sql/post_analytics.sql"
 )
 
 # ── MinIO check — list objects under clean/ via mc (same image as minio-init) ─
@@ -427,12 +424,11 @@ default_args = {
     "owner": "data-eng",
     "retries": 2,
     "retry_delay": timedelta(minutes=1),
-    # SLA: if the whole run isn't done in 5.5 min, Airflow marks it as an SLA
+    # SLA: if the whole run isn't done in 11 min, Airflow marks it as an SLA
     # miss (visible in the UI / sendable to Slack/email) without failing the
-    # run outright. Kept under the 7-minute schedule interval so a slow run
-    # is flagged before the next one is even due — tune this once you know
-    # real Spark job durations on your hardware.
-    "sla": timedelta(minutes=5, seconds=30),
+    # run outright. The 180-second streaming window plus Spark startup and
+    # JDBC writes needs more than the old 5.5-minute budget.
+    "sla": timedelta(minutes=11),
 }
 
 with DAG(
@@ -450,7 +446,7 @@ with DAG(
     schedule=timedelta(minutes=7),
     start_date=pendulum.datetime(2026, 1, 1, 15, 0, tz="Africa/Cairo"),
     catchup=False,
-    dagrun_timeout=timedelta(minutes=5),
+    dagrun_timeout=timedelta(minutes=12),
     max_active_runs=1,          # never let two pipeline runs overlap — if a
                                  # run takes longer than 7 min, the next one
                                  # queues behind it instead of running in
