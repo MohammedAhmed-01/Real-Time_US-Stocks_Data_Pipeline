@@ -1,203 +1,448 @@
-import pandas as pd
+"""
+build_vector_db.py
+
+Build ChromaDB from:
+
+1. StockHistory CSV files
+2. metrics_all_models.csv
+3. walk_forward.csv
+
+Stock documents include metadata:
+    ticker
+    type
+
+This allows ticker-aware retrieval.
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+
+import chromadb
+from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
+
+from text_converter import (
+    stock_csv_to_documents,
+    generic_csv_to_documents,
+)
 
 
 # ============================================================
-# Column mapping
+# PATHS
 # ============================================================
 
-STOCK_COLUMN_MAP = {
-    "date": "Date",
-    "open": "Open",
-    "high": "High",
-    "low": "Low",
-    "close": "Close",
-    "volume": "Volume",
-}
+STOCKHISTORY_DIR = (
+    "/kaggle/input/datasets/"
+    "footballjoe789/us-stock-dataset/"
+    "Data/StockHistory"
+)
 
+OUTPUTS_DIR = (
+    "/kaggle/input/datasets/"
+    "mohamedyounis15/data-used/"
+    "Outputs"
+)
 
-# ============================================================
-# Find column
-# ============================================================
+METRICS_CSV_PATH = os.path.join(
+    OUTPUTS_DIR,
+    "metrics_all_models.csv"
+)
 
-def _find_column(df: pd.DataFrame, wanted: str) -> str:
+WALKFORWARD_CSV_PATH = os.path.join(
+    OUTPUTS_DIR,
+    "walk_forward.csv"
+)
 
-    if wanted in df.columns:
-        return wanted
+CHROMA_DB_PATH = "/kaggle/working/chroma_db"
 
-    lowered = {
-        str(c).lower(): c
-        for c in df.columns
-    }
+COLLECTION_NAME = "stocks_knowledge_base"
 
-    if wanted.lower() in lowered:
-        return lowered[wanted.lower()]
-
-    raise KeyError(
-        f"Column '{wanted}' not found. "
-        f"Available columns: {list(df.columns)}"
-    )
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 
 # ============================================================
-# Stock row → text
+# SETTINGS
 # ============================================================
 
-def stock_row_to_text(
-    row: pd.Series,
-    ticker: str,
-    column_map: dict = STOCK_COLUMN_MAP
-) -> str:
+CHUNK_SIZE = 5
 
-    c = column_map
+YEARS_BACK = 2
 
-    return (
-        f"On {row[c['date']]}, "
-        f"{ticker} stock opened at "
-        f"${float(row[c['open']]):.2f}, "
-        f"reached a high of "
-        f"${float(row[c['high']]):.2f} "
-        f"and a low of "
-        f"${float(row[c['low']]):.2f}, "
-        f"and closed at "
-        f"${float(row[c['close']]):.2f}, "
-        f"with a trading volume of "
-        f"{int(row[c['volume']]):,} shares."
-    )
+ENCODE_BATCH_SIZE = 256
+
+# None = all tickers
+LIMIT_TICKERS = None
 
 
 # ============================================================
-# Generic row → text
+# CHUNKING
 # ============================================================
 
-def generic_row_to_text(
-    row: pd.Series,
-    label: str
-) -> str:
-
-    parts = []
-
-    for col, val in row.items():
-
-        if pd.isna(val):
-            continue
-
-        clean_col = (
-            str(col)
-            .replace("_", " ")
-            .strip()
-        )
-
-        parts.append(
-            f"{clean_col}: {val}"
-        )
-
-    return (
-        f"{label} record — "
-        + ", ".join(parts)
-        + "."
-    )
-
-
-# ============================================================
-# Stock CSV → documents
-# ============================================================
-
-def stock_csv_to_documents(
-    csv_path: str,
-    ticker: str,
-    years_back: int | None = None
+def make_chunks(
+    documents: list[str],
+    chunk_size: int = CHUNK_SIZE
 ) -> list[str]:
 
-    print(f"Reading: {csv_path}")
+    chunks = []
 
-    df = pd.read_csv(csv_path)
+    for i in range(
+        0,
+        len(documents),
+        chunk_size
+    ):
 
-    print(
-        f"{ticker}: "
-        f"{len(df):,} rows loaded"
-    )
-
-    date_col = _find_column(
-        df,
-        STOCK_COLUMN_MAP["date"]
-    )
-
-    df[date_col] = pd.to_datetime(
-        df[date_col],
-        errors="coerce"
-    )
-
-    df = df.dropna(
-        subset=[date_col]
-    )
-
-    if years_back is not None and not df.empty:
-
-        cutoff = (
-            df[date_col].max()
-            - pd.DateOffset(years=years_back)
+        chunks.append(
+            " ".join(
+                documents[
+                    i:i + chunk_size
+                ]
+            )
         )
 
-        df = df[
-            df[date_col] >= cutoff
+    return chunks
+
+
+# ============================================================
+# ADD STOCK CHUNKS
+# ============================================================
+
+def add_stock_chunks(
+    collection,
+    chunks,
+    embedder,
+    ticker,
+    start_id
+):
+
+    next_id = start_id
+
+    for i in range(
+        0,
+        len(chunks),
+        ENCODE_BATCH_SIZE
+    ):
+
+        batch = chunks[
+            i:i + ENCODE_BATCH_SIZE
         ]
 
-        print(
-            f"{ticker}: "
-            f"{len(df):,} rows after "
-            f"{years_back}-year filter"
+        embeddings = embedder.encode(
+            batch,
+            show_progress_bar=False
+        ).tolist()
+
+        ids = [
+            f"stock_{ticker}_{next_id + j}"
+            for j in range(len(batch))
+        ]
+
+        metadatas = [
+            {
+                "ticker": ticker,
+                "type": "stock"
+            }
+            for _ in batch
+        ]
+
+        collection.add(
+            documents=batch,
+            embeddings=embeddings,
+            ids=ids,
+            metadatas=metadatas
         )
 
-    documents = []
+        next_id += len(batch)
 
-    for _, row in df.iterrows():
+    return next_id
+
+
+# ============================================================
+# ADD GENERIC CHUNKS
+# ============================================================
+
+def add_generic_chunks(
+    collection,
+    chunks,
+    embedder,
+    data_type,
+    start_id
+):
+
+    next_id = start_id
+
+    for i in range(
+        0,
+        len(chunks),
+        ENCODE_BATCH_SIZE
+    ):
+
+        batch = chunks[
+            i:i + ENCODE_BATCH_SIZE
+        ]
+
+        embeddings = embedder.encode(
+            batch,
+            show_progress_bar=False
+        ).tolist()
+
+        ids = [
+            f"{data_type}_{next_id + j}"
+            for j in range(len(batch))
+        ]
+
+        metadatas = [
+            {
+                "type": data_type
+            }
+            for _ in batch
+        ]
+
+        collection.add(
+            documents=batch,
+            embeddings=embeddings,
+            ids=ids,
+            metadatas=metadatas
+        )
+
+        next_id += len(batch)
+
+    return next_id
+
+
+# ============================================================
+# BUILD DATABASE
+# ============================================================
+
+def build_database():
+
+    print("=" * 60)
+    print("BUILDING RAG VECTOR DATABASE")
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # Embedding model
+    # --------------------------------------------------------
+
+    print("\nLoading embedding model...")
+
+    embedder = SentenceTransformer(
+        EMBEDDING_MODEL_NAME
+    )
+
+    # --------------------------------------------------------
+    # ChromaDB
+    # --------------------------------------------------------
+
+    print("Setting up ChromaDB...")
+
+    client = chromadb.PersistentClient(
+        path=CHROMA_DB_PATH
+    )
+
+    try:
+
+        client.delete_collection(
+            COLLECTION_NAME
+        )
+
+        print(
+            "Old collection deleted."
+        )
+
+    except Exception:
+
+        pass
+
+    collection = client.create_collection(
+        name=COLLECTION_NAME
+    )
+
+    next_id = 0
+
+    # --------------------------------------------------------
+    # STOCK FILES
+    # --------------------------------------------------------
+
+    if not os.path.isdir(
+        STOCKHISTORY_DIR
+    ):
+
+        raise FileNotFoundError(
+            f"Stock directory not found:\n"
+            f"{STOCKHISTORY_DIR}"
+        )
+
+    ticker_files = sorted(
+        glob.glob(
+            os.path.join(
+                STOCKHISTORY_DIR,
+                "*.csv"
+            )
+        )
+    )
+
+    print(
+        f"\nFound {len(ticker_files):,} "
+        f"stock CSV files."
+    )
+
+    if LIMIT_TICKERS is not None:
+
+        ticker_files = (
+            ticker_files[:LIMIT_TICKERS]
+        )
+
+    print(
+        f"Using {len(ticker_files):,} "
+        f"tickers for this build."
+    )
+
+    total_rows = 0
+
+    # --------------------------------------------------------
+    # Process stocks
+    # --------------------------------------------------------
+
+    for path in tqdm(
+        ticker_files,
+        desc="Processing tickers"
+    ):
+
+        ticker = os.path.splitext(
+            os.path.basename(path)
+        )[0]
 
         try:
 
-            text = stock_row_to_text(
-                row,
-                ticker
+            docs = stock_csv_to_documents(
+                path,
+                ticker,
+                years_back=YEARS_BACK
             )
-
-            documents.append(text)
 
         except Exception as e:
 
             print(
-                f"WARNING: Failed to convert "
-                f"{ticker} row: {e}"
+                f"WARNING: Skipping "
+                f"{ticker}: {e}"
             )
 
-    return documents
+            continue
 
+        if not docs:
+            continue
 
-# ============================================================
-# Generic CSV → documents
-# ============================================================
+        total_rows += len(docs)
 
-def generic_csv_to_documents(
-    csv_path: str,
-    label: str
-) -> list[str]:
+        chunks = make_chunks(
+            docs,
+            CHUNK_SIZE
+        )
 
-    print(f"Reading: {csv_path}")
-
-    df = pd.read_csv(csv_path)
+        next_id = add_stock_chunks(
+            collection=collection,
+            chunks=chunks,
+            embedder=embedder,
+            ticker=ticker,
+            start_id=next_id
+        )
 
     print(
-        f"{label}: "
-        f"{len(df):,} rows loaded"
+        f"\nTotal stock rows embedded: "
+        f"{total_rows:,}"
     )
 
-    documents = []
+    # --------------------------------------------------------
+    # Other datasets
+    # --------------------------------------------------------
 
-    for _, row in df.iterrows():
+    files_to_process = [
 
-        text = generic_row_to_text(
-            row,
+        (
+            METRICS_CSV_PATH,
+            "Model evaluation metric",
+            "metrics"
+        ),
+
+        (
+            WALKFORWARD_CSV_PATH,
+            "Walk-forward validation",
+            "walkfwd"
+        )
+
+    ]
+
+    for (
+        path,
+        label,
+        prefix
+    ) in files_to_process:
+
+        if not os.path.exists(path):
+
+            print(
+                f"NOTE: File not found: "
+                f"{path}"
+            )
+
+            continue
+
+        docs = generic_csv_to_documents(
+            path,
             label
         )
 
-        documents.append(text)
+        chunks = make_chunks(
+            docs,
+            CHUNK_SIZE
+        )
 
-    return documents
+        next_id = add_generic_chunks(
+            collection=collection,
+            chunks=chunks,
+            embedder=embedder,
+            data_type=prefix,
+            start_id=next_id
+        )
+
+        print(
+            f"{os.path.basename(path)}:"
+        )
+
+        print(
+            f"  Rows: {len(docs):,}"
+        )
+
+        print(
+            f"  Chunks: {len(chunks):,}"
+        )
+
+    # --------------------------------------------------------
+    # Final information
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 60)
+    print("DATABASE BUILD COMPLETE")
+    print("=" * 60)
+
+    print(
+        f"Location: {CHROMA_DB_PATH}"
+    )
+
+    print(
+        f"Collection: {COLLECTION_NAME}"
+    )
+
+    print(
+        f"Total chunks: {next_id:,}"
+    )
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+    build_database()
