@@ -1,153 +1,103 @@
-# 🌐 Distributed Pipeline Cluster — High Availability (HA) على Windows
-## Real-Time US Stocks Data Pipeline | 3 أجهزة Windows بـ Docker Swarm + Tailscale
-### كل جهاز يحمل كل شيء — الـ Failover تلقائي
+# 🖥️ Docker Swarm Cluster على Windows
+## Real-Time US Stocks Data Pipeline
+### 1 Master + 2 Workers — خطوة بخطوة
 
 ---
 
-> **الهدف من هذا الدليل:** كل جهاز من الثلاثة يشغّل نسخة كاملة من كل service. لو الـ Master وقع، أحد الـ Workers يأخذ دوره تلقائياً بدون تدخل.
+## 📌 قبل ما تبدأ — سجّل المعلومات دي
 
----
-
-## 📋 جدول المحتويات
-
-1. [المعمارية — HA كاملة](#1-المعمارية)
-2. [متطلبات الأجهزة والبرامج](#2-المتطلبات)
-3. [المرحلة 1 — تثبيت Tailscale على Windows](#3-مرحلة-1--tailscale)
-4. [المرحلة 2 — تثبيت Docker Desktop على Windows](#4-مرحلة-2--docker-desktop)
-5. [المرحلة 3 — إنشاء Swarm Cluster بـ 3 Managers](#5-مرحلة-3--swarm-cluster)
-6. [المرحلة 4 — إعداد Shared Storage بـ NFS على Windows](#6-مرحلة-4--shared-storage)
-7. [المرحلة 5 — بناء Docker Images ورفعها لـ Registry](#7-مرحلة-5--docker-images)
-8. [المرحلة 6 — ملف docker-stack.yml للـ HA الكاملة](#8-مرحلة-6--docker-stackyml)
-9. [المرحلة 7 — Deploy الـ Stack](#9-مرحلة-7--deploy)
-10. [المرحلة 8 — اختبار الـ Failover](#10-مرحلة-8--اختبار-الـ-failover)
-11. [الـ URLs والـ Ports بعد الـ Deploy](#11-الـ-urls-والـ-ports)
-12. [Troubleshooting شامل لـ Windows](#12-troubleshooting)
-
----
-
-## 1. المعمارية
-
-### مبدأ HA في هذا الإعداد
+افتح PowerShell على كل جهاز وشغّل `hostname` — سجّل الناتج هنا:
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                    TAILSCALE VPN MESH (100.x.x.x)                     │
-│                                                                        │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────────┐    │
-│  │    NODE 1        │  │    NODE 2        │  │    NODE 3         │    │
-│  │  (PC الأول)      │  │  (PC الثاني)     │  │  (PC الثالث)      │    │
-│  │  Swarm Manager   │  │  Swarm Manager   │  │  Swarm Manager    │    │
-│  │                  │  │                  │  │                   │    │
-│  │ ✅ kafka-1       │  │ ✅ kafka-2       │  │ ✅ kafka-3        │    │
-│  │ ✅ kafka-init    │  │                  │  │                   │    │
-│  │ ✅ minio         │  │ ✅ minio         │  │ ✅ minio          │    │
-│  │ ✅ postgres      │  │ ✅ postgres      │  │ ✅ postgres        │    │
-│  │    (primary)     │  │    (standby)     │  │    (standby)      │    │
-│  │ ✅ spark-master  │  │ ✅ spark-worker  │  │ ✅ spark-worker   │    │
-│  │ ✅ producer      │  │                  │  │                   │    │
-│  │ ✅ consumer      │  │                  │  │                   │    │
-│  │ ✅ kafka-ui      │  │ ✅ kafka-ui      │  │ ✅ kafka-ui       │    │
-│  │ ✅ pgadmin       │  │                  │  │                   │    │
-│  │ ✅ airflow       │  │                  │  │                   │    │
-│  └──────────────────┘  └──────────────────┘  └───────────────────┘    │
-│                                                                        │
-│   كل جهاز Manager ← لو NODE 1 وقع، NODE 2 يصبح Leader تلقائياً      │
-└────────────────────────────────────────────────────────────────────────┘
+MASTER_HOSTNAME = _______________   ← الجهاز الأقوى
+WORKER1_HOSTNAME = ______________
+WORKER2_HOSTNAME = ______________
 ```
 
-### الفرق عن الإعداد العادي
+بعد ما تثبّت Tailscale (خطوة 2)، سجّل الـ IPs هنا:
 
-| الإعداد العادي | الإعداد الحالي (HA) |
-|---|---|
-| Master = Manager وحيد | كل الأجهزة الثلاثة = Managers |
-| لو الـ Master وقع، الـ Cluster مات | لو جهاز وقع، التانيين يكملوا |
-| Kafka RF=3 لكن Manager واحد | Kafka RF=3 + Swarm Quorum يحتاج 2 من 3 |
-| PostgreSQL على Master بس | PostgreSQL primary على NODE1، standby على NODE2/3 |
-
-> **ملاحظة Quorum:** Docker Swarm يحتاج أغلبية الـ Managers تكون متصلة. مع 3 Managers، تقدر يوقع جهاز واحد وكل حاجة تكمل. لو وقع 2، الـ Cluster يتوقف عن قبول تغييرات (لكن الـ Containers الشغّالة تكمل).
+```
+MASTER_IP  = 100.___.___.___ 
+WORKER1_IP = 100.___.___.___ 
+WORKER2_IP = 100.___.___.___ 
+```
 
 ---
 
-## 2. المتطلبات
+## المرحلة 1 — تثبيت WSL2 وUbuntu
 
-### متطلبات كل جهاز
+> ⚠️ **على الثلاثة أجهزة بنفس الترتيب**
 
-| المتطلب | الحد الأدنى | الموصى به |
-|---|---|---|
-| Windows | Windows 10 Pro/Enterprise (Build 19041+) أو Windows 11 | Windows 11 |
-| RAM | 8 GB | 16 GB |
-| CPU | 4 Cores | 6+ Cores |
-| Disk | 80 GB | 150 GB SSD |
-| Network | أي اتصال بالإنترنت | Stable Broadband |
+### الخطوة 1.1 — افتح PowerShell كـ Administrator
 
-> **مهم جداً:** Windows 10 Home **لا يدعم** Hyper-V وبالتالي لا يدعم Docker Desktop بالشكل الكامل. الحل: استخدم WSL2 backend فقط.
+ابحث عن PowerShell في Start Menu → كليك يمين → **Run as Administrator**
 
-### البرامج المطلوبة على كل جهاز
-
-- [Tailscale for Windows](https://tailscale.com/download/windows) — VPN Mesh
-- [Docker Desktop for Windows](https://www.docker.com/products/docker-desktop/) — مع WSL2 Backend
-- [Windows Subsystem for Linux 2 (WSL2)](https://learn.microsoft.com/en-us/windows/wsl/install) — Ubuntu 22.04
-
-### معلومات تحتاجها قبل البدء
-
-على كل جهاز شغّل هذا الأمر في PowerShell وسجّل النتيجة:
+### الخطوة 1.2 — فعّل WSL2
 
 ```powershell
-hostname
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
 ```
 
-سنستخدم في هذا الدليل:
-- `PC1` = الجهاز الأول (NODE 1)
-- `PC2` = الجهاز الثاني (NODE 2)
-- `PC3` = الجهاز الثالث (NODE 3)
+**أعد تشغيل الجهاز الآن.**
+
+### الخطوة 1.3 — بعد الـ Restart، ثبّت Ubuntu
+
+افتح PowerShell كـ Administrator مجدداً:
+
+```powershell
+wsl --set-default-version 2
+wsl --install -d Ubuntu-22.04
+```
+
+سيطلب منك إدخال **username** وـ **password** لـ Ubuntu. أدخل أي اسم تحبه (مثلاً `stocks`) وكلمة مرور.
+
+### الخطوة 1.4 — تحقق
+
+```powershell
+wsl --list --verbose
+```
+
+المطلوب: ترى `Ubuntu-22.04` بجانبها `Running` وإصدار `2`.
 
 ---
 
-## 3. مرحلة 1 — Tailscale
+## المرحلة 2 — تثبيت Tailscale
 
-> **اعمل الخطوات دي على الثلاثة أجهزة.**
+> ⚠️ **على الثلاثة أجهزة — استخدم نفس الـ Account**
 
-### الخطوة 3.1 — تثبيت Tailscale
+### الخطوة 2.1 — حمّل وثبّت
 
-1. افتح المتصفح وروح على: https://tailscale.com/download/windows
-2. حمّل الـ installer وشغّله
-3. اتبع الخطوات العادية للتثبيت
-4. بعد التثبيت، Tailscale هيظهر في الـ System Tray (ساعة Windows)
+1. افتح المتصفح: **https://tailscale.com/download/windows**
+2. حمّل وشغّل الـ installer
+3. بعد التثبيت ستجد Tailscale icon في الـ System Tray (بجانب الساعة)
 
-### الخطوة 3.2 — تسجيل الدخول
+### الخطوة 2.2 — سجّل الدخول
 
-1. على كل جهاز، اضغط بيمين على Tailscale icon في الـ System Tray
-2. اختر **"Log in"**
-3. في المتصفح، سجّل دخول بـ Google أو GitHub أو Microsoft
-4. **استخدم نفس الـ Account على الأجهزة الثلاثة**
+1. كليك يمين على الـ Tailscale icon في الـ System Tray
+2. اختر **Log in**
+3. في المتصفح: سجّل دخول بـ Google أو GitHub أو Microsoft
+4. **مهم جداً:** استخدم **نفس الـ Account** على الثلاثة أجهزة
 
-### الخطوة 3.3 — اعرف الـ Tailscale IP لكل جهاز
+### الخطوة 2.3 — اعرف الـ Tailscale IP لكل جهاز
 
-على كل جهاز، افتح PowerShell وشغّل:
+شغّل في PowerShell على كل جهاز:
 
 ```powershell
-# طريقة 1 — من PowerShell
-(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -like "100.*"}).IPAddress
+& "C:\Program Files\Tailscale\tailscale.exe" ip -4
 ```
 
 أو:
 
 ```powershell
-# طريقة 2 — من Tailscale تنفسه
-& "C:\Program Files\Tailscale\tailscale.exe" ip
+Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -like "100.*"} | Select-Object IPAddress
 ```
 
-**سجّل النتائج هنا (استبدل بالـ IPs الحقيقية):**
+**سجّل الـ IPs في الجدول أعلاه.**
 
-```
-NODE1_IP=100.x.x.1   ← PC1
-NODE2_IP=100.x.x.2   ← PC2
-NODE3_IP=100.x.x.3   ← PC3
-```
+### الخطوة 2.4 — اختبر الاتصال بين الأجهزة
 
-### الخطوة 3.4 — اختبر الاتصال بين الأجهزة
-
-على PC1، شغّل في PowerShell:
+على الـ Master، شغّل:
 
 ```powershell
 # استبدل بالـ IPs الحقيقية
@@ -155,473 +105,289 @@ ping 100.x.x.2 -n 4
 ping 100.x.x.3 -n 4
 ```
 
-على PC2:
-
-```powershell
-ping 100.x.x.1 -n 4
-ping 100.x.x.3 -n 4
-```
-
 **لازم كل الـ pings تنجح قبل ما تكمل.**
-
-### الخطوة 3.5 — تحقق إن Tailscale شغّال
-
-```powershell
-# من أي جهاز
-& "C:\Program Files\Tailscale\tailscale.exe" status
-```
-
-الناتج المتوقع:
-
-```
-100.x.x.1  PC1  your-account@  windows  -
-100.x.x.2  PC2  your-account@  windows  -
-100.x.x.3  PC3  your-account@  windows  -
-```
 
 ---
 
-## 4. مرحلة 2 — Docker Desktop
+## المرحلة 3 — تثبيت Docker Desktop
 
-> **اعمل الخطوات دي على الثلاثة أجهزة.**
+> ⚠️ **على الثلاثة أجهزة**
 
-### الخطوة 4.1 — تفعيل WSL2
+### الخطوة 3.1 — حمّل وثبّت Docker Desktop
 
-افتح PowerShell كـ Administrator على كل جهاز:
-
-```powershell
-# تفعيل WSL و Virtual Machine Platform
-dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
-dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
-
-# أعد تشغيل الجهاز
-Restart-Computer
-```
-
-بعد الـ Restart، افتح PowerShell كـ Administrator مرة ثانية:
-
-```powershell
-# اجعل WSL2 هو الإصدار الافتراضي
-wsl --set-default-version 2
-
-# ثبّت Ubuntu 22.04
-wsl --install -d Ubuntu-22.04
-
-# انتظر حتى ينتهي التثبيت ويطلب منك Username وPassword
-# أدخل اسم مستخدم (مثلاً: stocks) وكلمة مرور
-```
-
-### الخطوة 4.2 — تثبيت Docker Desktop
-
-1. افتح المتصفح وروح على: https://www.docker.com/products/docker-desktop/
-2. حمّل **"Docker Desktop for Windows"**
+1. افتح المتصفح: **https://www.docker.com/products/docker-desktop/**
+2. اضغط **Download for Windows**
 3. شغّل الـ installer
-4. في خطوة الـ Configuration، تأكد من اختيار:
-   - ✅ **"Use WSL 2 instead of Hyper-V"**
-   - ✅ **"Add shortcut to desktop"**
-5. بعد التثبيت، أعد تشغيل الجهاز
+4. في شاشة الإعداد تأكد من اختيار: ✅ **Use WSL 2 instead of Hyper-V**
+5. بعد التثبيت أعد تشغيل الجهاز
 
-### الخطوة 4.3 — إعداد Docker Desktop
+### الخطوة 3.2 — اضبط Docker Desktop
 
 بعد الـ Restart:
-
 1. افتح Docker Desktop
-2. اذهب لـ **Settings** (⚙️ icon)
-3. في **General**:
-   - ✅ تأكد من تفعيل **"Use the WSL 2 based engine"**
-4. في **Resources → WSL Integration**:
-   - ✅ فعّل الـ Integration مع Ubuntu-22.04
-5. اضغط **"Apply & Restart"**
+2. اذهب لـ ⚙️ **Settings**
+3. في **General**: تأكد أن ✅ **Use the WSL 2 based engine** مفعّل
+4. في **Resources → WSL Integration**: فعّل Ubuntu-22.04 ✅
+5. في **Resources → Advanced**:
+   - **CPUs**: نص ما عندك على الأقل
+   - **Memory**: 8 GB على الأقل (12 GB أفضل)
+   - **Disk image size**: 80 GB
+6. اضغط **Apply & Restart**
 
-### الخطوة 4.4 — زيادة موارد Docker (مهم جداً)
-
-في Docker Desktop → Settings → Resources:
-
-| الإعداد | القيمة الموصى بها |
-|---|---|
-| CPUs | كل الـ CPUs المتاحة (أو نصها على الأقل) |
-| Memory | 8 GB على الأقل (12 GB أفضل) |
-| Swap | 2 GB |
-| Disk image size | 80 GB على الأقل |
-
-اضغط **"Apply & Restart"**
-
-### الخطوة 4.5 — اختبر Docker
-
-افتح PowerShell العادي (مش Administrator):
+### الخطوة 3.3 — تحقق من Docker
 
 ```powershell
 docker version
-docker compose version
 docker run --rm hello-world
 ```
 
-لازم يشتغل بدون أخطاء.
+---
 
-### الخطوة 4.6 — إعداد Firewall لـ Docker Swarm
+## المرحلة 4 — فتح الـ Ports المطلوبة لـ Docker Swarm
 
-Docker Swarm يحتاج ports معينة. لأن الاتصال عبر Tailscale، نفتح هذه الـ Ports على الـ Tailscale Interface فقط.
-
-افتح PowerShell كـ Administrator على كل جهاز:
+> ⚠️ **على الثلاثة أجهزة — PowerShell كـ Administrator**
 
 ```powershell
-# اعرف اسم الـ Tailscale Network Adapter
-Get-NetAdapter | Where-Object {$_.InterfaceDescription -like "*Tailscale*"}
-# عادةً اسمه "Tailscale"
+# Port 2377 — Swarm management (Master فقط يحتاجه، لكن افتحه على الكل)
+netsh advfirewall firewall add rule name="Swarm-2377" dir=in action=allow protocol=TCP localport=2377 remoteip=100.0.0.0/8
 
-# افتح الـ Ports المطلوبة لـ Docker Swarm
-# Port 2377 — Swarm cluster management
-netsh advfirewall firewall add rule name="Docker Swarm Port 2377" dir=in action=allow protocol=TCP localport=2377 remoteip=100.0.0.0/8
+# Port 7946 — Node communication
+netsh advfirewall firewall add rule name="Swarm-7946-TCP" dir=in action=allow protocol=TCP localport=7946 remoteip=100.0.0.0/8
+netsh advfirewall firewall add rule name="Swarm-7946-UDP" dir=in action=allow protocol=UDP localport=7946 remoteip=100.0.0.0/8
 
-# Port 7946 — Node Communication (TCP + UDP)
-netsh advfirewall firewall add rule name="Docker Swarm Port 7946 TCP" dir=in action=allow protocol=TCP localport=7946 remoteip=100.0.0.0/8
-netsh advfirewall firewall add rule name="Docker Swarm Port 7946 UDP" dir=in action=allow protocol=UDP localport=7946 remoteip=100.0.0.0/8
-
-# Port 4789 — Overlay Network (VXLAN)
-netsh advfirewall firewall add rule name="Docker Swarm Port 4789 UDP" dir=in action=allow protocol=UDP localport=4789 remoteip=100.0.0.0/8
+# Port 4789 — Overlay network (VXLAN)
+netsh advfirewall firewall add rule name="Swarm-4789-UDP" dir=in action=allow protocol=UDP localport=4789 remoteip=100.0.0.0/8
 
 # تحقق
-netsh advfirewall firewall show rule name="Docker Swarm Port 2377"
+netsh advfirewall firewall show rule name="Swarm-2377"
 ```
 
-> **ملاحظة:** الـ `100.0.0.0/8` هو نطاق Tailscale IPs. هذا يعني إننا نسمح فقط للأجهزة الموصولة بـ Tailscale.
+> `100.0.0.0/8` هو نطاق Tailscale — يعني نسمح فقط للأجهزة الموجودة في الـ Tailnet.
 
 ---
 
-## 5. مرحلة 3 — Swarm Cluster
+## المرحلة 5 — إنشاء Docker Swarm
 
-> **في هذا الإعداد HA، الثلاثة أجهزة كلهم Managers** — مش Manager و Workers. هذا يضمن إن الـ Cluster يكمل حتى لو وقع جهازان (لن يكمل، لكن إذا وقع جهاز واحد فقط، التانيين يكملوا).
-
-### الخطوة 5.1 — Initialize الـ Swarm على PC1
-
-افتح PowerShell على PC1:
+### الخطوة 5.1 — Init الـ Swarm على الـ MASTER فقط
 
 ```powershell
-# استبدل 100.x.x.1 بـ Tailscale IP الحقيقي لـ PC1
+# ← استبدل 100.x.x.1 بـ Tailscale IP الـ Master الحقيقي
 docker swarm init --advertise-addr 100.x.x.1
 ```
 
-الناتج:
+ستظهر رسالة زي دي — **احفظ الأمر الأخضر:**
 
 ```
-Swarm initialized: current node (XXXXXXXX) is now a manager.
+Swarm initialized: current node (abcd1234) is now a manager.
 
 To add a worker to this swarm, run the following command:
-    docker swarm join --token SWMTKN-1-xxxx-yyyy 100.x.x.1:2377
 
-To add a manager to this swarm, run 'docker swarm join-token manager' and follow the instructions.
+    docker swarm join --token SWMTKN-1-xxxxxxxxxxxxxxxxxx-yyyyyyyyyyyyyyyyyy 100.x.x.1:2377
 ```
 
-### الخطوة 5.2 — احصل على Manager Token
+### الخطوة 5.2 — لو نسيت الـ Token
 
 ```powershell
-# على PC1 فقط
-# نحتاج Manager token (مش Worker token) عشان كل الأجهزة تكون Managers
-docker swarm join-token manager
+# على الـ Master
+docker swarm join-token worker
 ```
 
-الناتج:
+### الخطوة 5.3 — أضف Worker 1 للـ Swarm
 
-```
-To add a manager to this swarm, run the following command:
-
-    docker swarm join --token SWMTKN-1-MANAGER-TOKEN-HERE 100.x.x.1:2377
-```
-
-**احفظ هذا الأمر — ستحتاجه للخطوات التالية.**
-
-### الخطوة 5.3 — أضف PC2 كـ Manager
-
-افتح PowerShell على PC2 والصق الأمر الذي حصلت عليه:
+افتح PowerShell على **WORKER 1** والصق الأمر الذي حصلت عليه:
 
 ```powershell
-# على PC2 فقط — استبدل بالـ Token الحقيقي
-docker swarm join \
-    --token SWMTKN-1-MANAGER-TOKEN-HERE \
-    100.x.x.1:2377
+# ← هذا مثال، استبدل بالـ Token الحقيقي
+docker swarm join --token SWMTKN-1-xxxxxxxxxxxxxxxxxx-yyyyyyyyyyyyyyyyyy 100.x.x.1:2377
 ```
 
-الناتج:
-
+الناتج المتوقع:
 ```
-This node joined a swarm as a manager.
+This node joined a swarm as a worker.
 ```
 
-### الخطوة 5.4 — أضف PC3 كـ Manager
+### الخطوة 5.4 — أضف Worker 2 للـ Swarm
 
-افتح PowerShell على PC3:
+نفس الأمر على **WORKER 2**:
 
 ```powershell
-# على PC3 فقط — نفس الأمر
-docker swarm join \
-    --token SWMTKN-1-MANAGER-TOKEN-HERE \
-    100.x.x.1:2377
+docker swarm join --token SWMTKN-1-xxxxxxxxxxxxxxxxxx-yyyyyyyyyyyyyyyyyy 100.x.x.1:2377
 ```
 
-### الخطوة 5.5 — تحقق من الـ Cluster
-
-على أي جهاز:
+### الخطوة 5.5 — تحقق من الـ Cluster على الـ Master
 
 ```powershell
 docker node ls
 ```
 
-الناتج المتوقع:
+المطلوب:
 
 ```
-ID                HOSTNAME   STATUS    AVAILABILITY   MANAGER STATUS   ENGINE VERSION
-XXXX *            PC1        Ready     Active         Leader           26.x.x
-YYYY              PC2        Ready     Active         Reachable        26.x.x
-ZZZZ              PC3        Ready     Active         Reachable        26.x.x
+ID              HOSTNAME    STATUS    AVAILABILITY   MANAGER STATUS   ENGINE VERSION
+xxxx *          master-pc   Ready     Active         Leader           26.x.x
+yyyy            worker1-pc  Ready     Active                          26.x.x
+zzzz            worker2-pc  Ready     Active                          26.x.x
 ```
 
-**الثلاثة لازم يكونوا `Ready` و `Active`. PC1 هو `Leader` والتانيين `Reachable`.**
-
-> **لو وقع PC1:** أحد PC2 أو PC3 سيصبح Leader تلقائياً.
+الـ `*` بجانب الـ ID يعني ده الـ Node الحالي. الـ Master لازم يكون `Leader`.
 
 ### الخطوة 5.6 — أضف Labels للـ Nodes
 
 ```powershell
-# على أي Manager (PC1)
+# على الـ Master فقط — استبدل الأسماء بالـ Hostnames الحقيقية
 
-# Labels لتحديد كل جهاز
-docker node update --label-add nodeid=node1 PC1
-docker node update --label-add nodeid=node2 PC2
-docker node update --label-add nodeid=node3 PC3
+# Labels تحدد دور كل جهاز
+docker node update --label-add role=master MASTER_HOSTNAME
+docker node update --label-add role=worker WORKER1_HOSTNAME
+docker node update --label-add role=worker WORKER2_HOSTNAME
 
-# Labels للـ Kafka (كل جهاز يشغّل broker مختلف)
-docker node update --label-add kafka.broker=1 PC1
-docker node update --label-add kafka.broker=2 PC2
-docker node update --label-add kafka.broker=3 PC3
-
-# Labels للـ Postgres (node1 هو primary)
-docker node update --label-add postgres.role=primary PC1
-docker node update --label-add postgres.role=standby PC2
-docker node update --label-add postgres.role=standby PC3
+# Labels تحدد أي Kafka Broker ينزل على أي جهاز
+docker node update --label-add kafka.broker=1 MASTER_HOSTNAME
+docker node update --label-add kafka.broker=2 WORKER1_HOSTNAME
+docker node update --label-add kafka.broker=3 WORKER2_HOSTNAME
 
 # تحقق
-docker node inspect PC1 --format '{{ .Spec.Labels }}'
-```
-
-### الخطوة 5.7 — أنشئ الـ Overlay Network
-
-```powershell
-# على PC1
-docker network create \
-    --driver overlay \
-    --attachable \
-    --subnet 10.20.0.0/16 \
-    stocks-net
+docker node inspect MASTER_HOSTNAME --format "{{ .Spec.Labels }}"
+docker node inspect WORKER1_HOSTNAME --format "{{ .Spec.Labels }}"
+docker node inspect WORKER2_HOSTNAME --format "{{ .Spec.Labels }}"
 ```
 
 ---
 
-## 6. مرحلة 4 — Shared Storage
-
-لأن Windows لا يدعم NFS Server مباشرة بسهولة، سنستخدم **Samba (SMB/CIFS)** — وهو بروتوكول مشاركة ملفات Windows الطبيعي.
-
-### الفكرة الكاملة
-
-```
-PC1 (SMB Server)
-    └── C:\stocks-data\
-           ├── minio-data\
-           ├── postgres-data\
-           ├── kafka-1-data\
-           ├── kafka-2-data\
-           └── kafka-3-data\
-
-PC2 وPC3 يعملوا Mount للمجلدات دي عبر Tailscale
-```
-
-### الخطوة 6.1 — إعداد SMB Share على PC1
-
-افتح PowerShell كـ Administrator على PC1:
+## المرحلة 6 — إنشاء الـ Overlay Network
 
 ```powershell
-# أنشئ المجلدات
-New-Item -ItemType Directory -Force -Path "C:\stocks-data\minio-data"
-New-Item -ItemType Directory -Force -Path "C:\stocks-data\postgres-data"
-New-Item -ItemType Directory -Force -Path "C:\stocks-data\kafka-1-data"
-New-Item -ItemType Directory -Force -Path "C:\stocks-data\kafka-2-data"
-New-Item -ItemType Directory -Force -Path "C:\stocks-data\kafka-3-data"
-New-Item -ItemType Directory -Force -Path "C:\stocks-data\airflow-logs"
-New-Item -ItemType Directory -Force -Path "C:\stocks-data\airflow-plugins"
-New-Item -ItemType Directory -Force -Path "C:\stocks-data\airflow-postgres-data"
+# على الـ Master فقط
+docker network create `
+    --driver overlay `
+    --attachable `
+    --subnet 10.20.0.0/16 `
+    stocks-net
 
-# أنشئ Share واحد يشمل كل المجلدات
-New-SmbShare -Name "stocks-data" `
+# تحقق
+docker network ls | Select-String "stocks-net"
+```
+
+الناتج:
+```
+xxxxxxxxxxxx   stocks-net   overlay   swarm
+```
+
+---
+
+## المرحلة 7 — إعداد الـ Shared Storage
+
+البيانات (Kafka logs, MinIO, Postgres) لازم تتشارك بين الأجهزة عبر الشبكة.
+سنستخدم **Windows SMB** (مشاركة ملفات Windows الطبيعية) فوق Tailscale.
+
+### الخطوة 7.1 — أنشئ مجلدات البيانات على الـ Master
+
+```powershell
+# على الـ MASTER فقط — PowerShell عادي (مش Admin)
+New-Item -ItemType Directory -Force "C:\stocks-data\minio-data"
+New-Item -ItemType Directory -Force "C:\stocks-data\postgres-data"
+New-Item -ItemType Directory -Force "C:\stocks-data\kafka-1-data"
+New-Item -ItemType Directory -Force "C:\stocks-data\kafka-2-data"
+New-Item -ItemType Directory -Force "C:\stocks-data\kafka-3-data"
+New-Item -ItemType Directory -Force "C:\stocks-data\airflow-logs"
+New-Item -ItemType Directory -Force "C:\stocks-data\airflow-plugins"
+New-Item -ItemType Directory -Force "C:\stocks-data\airflow-postgres"
+New-Item -ItemType Directory -Force "C:\stocks-data\registry"
+```
+
+### الخطوة 7.2 — شارك المجلد عبر SMB على الـ Master
+
+```powershell
+# على الـ MASTER — PowerShell كـ Administrator
+New-SmbShare `
+    -Name "stocks-data" `
     -Path "C:\stocks-data" `
     -FullAccess "Everyone" `
-    -Description "Docker Swarm Shared Storage for Stocks Pipeline"
+    -Description "Shared storage for Docker Swarm cluster"
 
 # تحقق
 Get-SmbShare -Name "stocks-data"
 ```
 
-### الخطوة 6.2 — افتح الـ Firewall للـ SMB على Tailscale فقط
+### الخطوة 7.3 — افتح الـ Firewall للـ SMB على الـ Master
 
 ```powershell
-# على PC1 — اسمح بـ SMB من Tailscale IPs فقط
+# على الـ MASTER — PowerShell كـ Administrator
 New-NetFirewallRule `
-    -DisplayName "Samba for Tailscale" `
+    -DisplayName "SMB for Tailscale" `
     -Direction Inbound `
     -Protocol TCP `
     -LocalPort 445 `
     -RemoteAddress "100.0.0.0/8" `
     -Action Allow
-
-New-NetFirewallRule `
-    -DisplayName "Samba NetBIOS for Tailscale" `
-    -Direction Inbound `
-    -Protocol TCP `
-    -LocalPort 139 `
-    -RemoteAddress "100.0.0.0/8" `
-    -Action Allow
 ```
 
-### الخطوة 6.3 — اختبر الوصول من PC2 وPC3
+### الخطوة 7.4 — اختبر الوصول من الـ Workers
 
-على PC2 وPC3، افتح PowerShell:
+على **WORKER 1** وـ **WORKER 2**:
 
 ```powershell
-# استبدل 100.x.x.1 بـ Tailscale IP لـ PC1
+# استبدل 100.x.x.1 بـ Tailscale IP للـ Master
 Test-NetConnection -ComputerName 100.x.x.1 -Port 445
-
-# لو نجح، جرّب تعرض المجلدات
-net view \\100.x.x.1\stocks-data
 ```
 
-### الخطوة 6.4 — أنشئ Docker NFS Volumes على كل الأجهزة
+المطلوب: `TcpTestSucceeded : True`
 
-> هذه الطريقة تستخدم Docker Volume مع SMB/CIFS driver.
+### الخطوة 7.5 — أنشئ Docker Volumes على الثلاثة أجهزة
 
-**أولاً، ثبّت الـ Volume Plugin على كل الأجهزة الثلاثة:**
-
-افتح PowerShell على كل جهاز:
+شغّل هذا الـ Script على **كل جهاز** (Master, Worker 1, Worker 2):
 
 ```powershell
-# ثبّت SMB volume plugin
-docker plugin install --grant-all-permissions vieux/sshfs || true
-# الـ plugin ده مش مناسب لـ SMB، هنستخدم طريقة أبسط
-```
+# ← غيّر هذا بـ Tailscale IP للـ Master
+$MASTER_IP = "100.x.x.1"
 
-**الطريقة الأبسط لـ Windows — استخدام Mount Points في WSL2:**
+# ← غيّر بـ Windows Username وPassword للـ Master
+$SMB_USER = "YOUR_MASTER_WINDOWS_USERNAME"
+$SMB_PASS = "YOUR_MASTER_WINDOWS_PASSWORD"
 
-على كل جهاز (PC1 وPC2 وPC3)، افتح **Ubuntu WSL2** من Start Menu وشغّل:
+$SMB_OPTS = "username=${SMB_USER},password=${SMB_PASS},vers=3.0"
 
-```bash
-# على PC1 — أنشئ مجلد المشاركة
-sudo mkdir -p /mnt/stocks-data
-
-# على PC2 وPC3 — Mount الـ SMB Share من PC1
-# استبدل 100.x.x.1 بـ Tailscale IP لـ PC1
-# استبدل YOUR_PC1_USERNAME بـ username الـ Windows على PC1
-
-sudo apt-get install -y cifs-utils
-
-sudo mkdir -p /mnt/stocks-data
-
-sudo mount -t cifs //100.x.x.1/stocks-data /mnt/stocks-data \
-    -o username=YOUR_PC1_USERNAME,password=YOUR_PC1_PASSWORD,uid=1000,gid=1000,vers=3.0
-
-# تحقق
-ls /mnt/stocks-data
-```
-
-**لجعل الـ Mount دائماً (عند بدء WSL2):**
-
-```bash
-# على PC2 وPC3 — أضف للـ /etc/fstab داخل WSL2
-echo "//100.x.x.1/stocks-data /mnt/stocks-data cifs username=PC1_USER,password=PC1_PASS,uid=1000,gid=1000,vers=3.0,_netdev 0 0" | sudo tee -a /etc/fstab
-
-# اختبر
-sudo mount -a
-```
-
-### الخطوة 6.5 — أنشئ Docker Volumes على كل الأجهزة الثلاثة
-
-شغّل هذا في PowerShell على **كل جهاز**:
-
-```powershell
-# PC1_TAILSCALE_IP = Tailscale IP لـ PC1
-$PC1_IP = "100.x.x.1"   # ← غيّر هذا
-
-# أنشئ الـ Volumes
-docker volume create --driver local `
-    --opt type=cifs `
-    --opt o="username=PC1_USER,password=PC1_PASS,vers=3.0" `
-    --opt device="//$PC1_IP/stocks-data/minio-data" `
-    minio-data
-
-docker volume create --driver local `
-    --opt type=cifs `
-    --opt o="username=PC1_USER,password=PC1_PASS,vers=3.0" `
-    --opt device="//$PC1_IP/stocks-data/postgres-data" `
-    postgres-data
-
-docker volume create --driver local `
-    --opt type=cifs `
-    --opt o="username=PC1_USER,password=PC1_PASS,vers=3.0" `
-    --opt device="//$PC1_IP/stocks-data/kafka-1-data" `
-    kafka-1-data
-
-docker volume create --driver local `
-    --opt type=cifs `
-    --opt o="username=PC1_USER,password=PC1_PASS,vers=3.0" `
-    --opt device="//$PC1_IP/stocks-data/kafka-2-data" `
-    kafka-2-data
-
-docker volume create --driver local `
-    --opt type=cifs `
-    --opt o="username=PC1_USER,password=PC1_PASS,vers=3.0" `
-    --opt device="//$PC1_IP/stocks-data/kafka-3-data" `
-    kafka-3-data
-
-docker volume create --driver local `
-    --opt type=cifs `
-    --opt o="username=PC1_USER,password=PC1_PASS,vers=3.0" `
-    --opt device="//$PC1_IP/stocks-data/airflow-logs" `
-    airflow-logs
-
-docker volume create --driver local `
-    --opt type=cifs `
-    --opt o="username=PC1_USER,password=PC1_PASS,vers=3.0" `
-    --opt device="//$PC1_IP/stocks-data/airflow-plugins" `
-    airflow-plugins
-
-docker volume create --driver local `
-    --opt type=cifs `
-    --opt o="username=PC1_USER,password=PC1_PASS,vers=3.0" `
-    --opt device="//$PC1_IP/stocks-data/airflow-postgres-data" `
-    airflow-postgres-data
+docker volume create --driver local --opt type=cifs --opt o="$SMB_OPTS" --opt device="//${MASTER_IP}/stocks-data/minio-data"       minio-data
+docker volume create --driver local --opt type=cifs --opt o="$SMB_OPTS" --opt device="//${MASTER_IP}/stocks-data/postgres-data"     postgres-data
+docker volume create --driver local --opt type=cifs --opt o="$SMB_OPTS" --opt device="//${MASTER_IP}/stocks-data/kafka-1-data"      kafka-1-data
+docker volume create --driver local --opt type=cifs --opt o="$SMB_OPTS" --opt device="//${MASTER_IP}/stocks-data/kafka-2-data"      kafka-2-data
+docker volume create --driver local --opt type=cifs --opt o="$SMB_OPTS" --opt device="//${MASTER_IP}/stocks-data/kafka-3-data"      kafka-3-data
+docker volume create --driver local --opt type=cifs --opt o="$SMB_OPTS" --opt device="//${MASTER_IP}/stocks-data/airflow-logs"      airflow-logs
+docker volume create --driver local --opt type=cifs --opt o="$SMB_OPTS" --opt device="//${MASTER_IP}/stocks-data/airflow-plugins"   airflow-plugins
+docker volume create --driver local --opt type=cifs --opt o="$SMB_OPTS" --opt device="//${MASTER_IP}/stocks-data/airflow-postgres"  airflow-postgres-data
+docker volume create --driver local --opt type=cifs --opt o="$SMB_OPTS" --opt device="//${MASTER_IP}/stocks-data/registry"         registry-data
 
 # تحقق
 docker volume ls
 ```
 
+> **ملاحظة بخصوص Username وPassword:** لو الـ Master ليس عليه password (تسجيل دخول بدون كلمة مرور)، ستحتاج لإنشاء كلمة مرور لحساب Windows أو إنشاء حساب جديد مخصص للمشاركة.
+
 ---
 
-## 7. مرحلة 5 — Docker Images
+## المرحلة 8 — Registry محلي لـ Docker Images
 
-### الخطوة 7.1 — أنشئ Registry محلي على PC1
+### الخطوة 8.1 — شغّل Registry على الـ Master
 
 ```powershell
-# على PC1
+# على الـ MASTER فقط
 docker run -d `
-    -p 5000:5000 `
     --name registry `
     --restart always `
-    -v "C:\stocks-data\registry:/var/lib/registry" `
+    -p 5000:5000 `
+    -v registry-data:/var/lib/registry `
     registry:2
 
 # تحقق
-Invoke-WebRequest -Uri "http://localhost:5000/v2/_catalog" -UseBasicParsing
+Invoke-WebRequest -Uri "http://localhost:5000/v2/_catalog" -UseBasicParsing | Select-Object Content
 ```
 
-### الخطوة 7.2 — أضف الـ Registry كـ Insecure على كل الأجهزة
+### الخطوة 8.2 — أضف الـ Registry كـ Insecure على الثلاثة أجهزة
 
-على كل جهاز، افتح Docker Desktop → Settings → Docker Engine، وعدّل الـ JSON:
+على كل جهاز:
+1. افتح Docker Desktop
+2. اذهب لـ ⚙️ Settings → Docker Engine
+3. في الـ JSON، أضف السطر الأحمر:
 
 ```json
 {
@@ -631,53 +397,74 @@ Invoke-WebRequest -Uri "http://localhost:5000/v2/_catalog" -UseBasicParsing
 }
 ```
 
-> استبدل `100.x.x.1` بـ Tailscale IP لـ PC1
+> استبدل `100.x.x.1` بـ Tailscale IP الـ Master
 
-اضغط **"Apply & Restart"**
+4. اضغط **Apply & Restart**
 
-### الخطوة 7.3 — ابني الـ Images على PC1
+---
 
-افتح PowerShell وروح لمجلد المشروع:
+## المرحلة 9 — بناء Images ورفعها للـ Registry
+
+### الخطوة 9.1 — على الـ MASTER فقط، روح لمجلد المشروع
 
 ```powershell
-# غيّر المسار لمجلد المشروع الفعلي
-cd C:\path\to\your\project
+# استبدل بالمسار الحقيقي
+cd C:\Users\YourName\Desktop\stocks-pipeline
 
-$REGISTRY = "100.x.x.1:5000"   # ← غيّر بـ Tailscale IP لـ PC1
-
-# 1. Python Image (Producer + Consumer)
-docker build -t stocks-python:latest -f Dockerfile.python .
-docker tag stocks-python:latest "${REGISTRY}/stocks-python:latest"
-docker push "${REGISTRY}/stocks-python:latest"
-
-# 2. Spark Image (قد يأخذ وقتاً طويلاً بسبب تحميل JARs)
-docker build -t stocks-spark:3.5.7 -f spark\Dockerfile .\spark
-docker tag stocks-spark:3.5.7 "${REGISTRY}/stocks-spark:3.5.7"
-docker push "${REGISTRY}/stocks-spark:3.5.7"
-
-# 3. Airflow Image
-docker build -t stocks-airflow:2.10.4 -f airflow\Dockerfile .\airflow
-docker tag stocks-airflow:2.10.4 "${REGISTRY}/stocks-airflow:2.10.4"
-docker push "${REGISTRY}/stocks-airflow:2.10.4"
-
-# تحقق من الـ Registry
-Invoke-WebRequest -Uri "http://${REGISTRY}/v2/_catalog" -UseBasicParsing | Select-Object -ExpandProperty Content
+# سجّل الـ Registry IP
+$REG = "100.x.x.1:5000"
 ```
 
-### الخطوة 7.4 — اسحب الـ Images على PC2 وPC3
+### الخطوة 9.2 — ابني Python Image
 
 ```powershell
-# على PC2 وPC3 — استبدل 100.x.x.1 بـ Tailscale IP لـ PC1
-$REGISTRY = "100.x.x.1:5000"
+docker build -t stocks-python:latest -f Dockerfile.python .
+docker tag stocks-python:latest "${REG}/stocks-python:latest"
+docker push "${REG}/stocks-python:latest"
+```
 
-docker pull "${REGISTRY}/stocks-python:latest"
-docker pull "${REGISTRY}/stocks-spark:3.5.7"
-docker pull "${REGISTRY}/stocks-airflow:2.10.4"
+### الخطوة 9.3 — ابني Spark Image
 
-# أعد التسمية
-docker tag "${REGISTRY}/stocks-python:latest" stocks-python:latest
-docker tag "${REGISTRY}/stocks-spark:3.5.7" stocks-spark:3.5.7
-docker tag "${REGISTRY}/stocks-airflow:2.10.4" stocks-airflow:2.10.4
+```powershell
+# هذا يأخذ وقتاً (10-20 دقيقة) لأنه يحمّل JARs
+docker build -t stocks-spark:3.5.7 -f spark\Dockerfile .\spark
+docker tag stocks-spark:3.5.7 "${REG}/stocks-spark:3.5.7"
+docker push "${REG}/stocks-spark:3.5.7"
+```
+
+### الخطوة 9.4 — ابني Airflow Image
+
+```powershell
+docker build -t stocks-airflow:2.10.4 -f airflow\Dockerfile .\airflow
+docker tag stocks-airflow:2.10.4 "${REG}/stocks-airflow:2.10.4"
+docker push "${REG}/stocks-airflow:2.10.4"
+```
+
+### الخطوة 9.5 — تحقق من الـ Images في الـ Registry
+
+```powershell
+Invoke-WebRequest -Uri "http://${REG}/v2/_catalog" -UseBasicParsing | Select-Object Content
+```
+
+المطلوب:
+```json
+{"repositories":["stocks-airflow","stocks-python","stocks-spark"]}
+```
+
+### الخطوة 9.6 — اسحب الـ Images على WORKER 1 وWORKER 2
+
+```powershell
+# على WORKER 1 وWORKER 2 — استبدل 100.x.x.1 بـ Master IP
+$REG = "100.x.x.1:5000"
+
+docker pull "${REG}/stocks-python:latest"
+docker pull "${REG}/stocks-spark:3.5.7"
+docker pull "${REG}/stocks-airflow:2.10.4"
+
+# أعد التسمية بالأسماء الأصلية
+docker tag "${REG}/stocks-python:latest" stocks-python:latest
+docker tag "${REG}/stocks-spark:3.5.7" stocks-spark:3.5.7
+docker tag "${REG}/stocks-airflow:2.10.4" stocks-airflow:2.10.4
 
 # تحقق
 docker images | Select-String "stocks"
@@ -685,24 +472,84 @@ docker images | Select-String "stocks"
 
 ---
 
-## 8. مرحلة 6 — docker-stack.yml
+## المرحلة 10 — ملف `.env`
 
-احفظ الملف التالي في مجلد المشروع على PC1 باسم `docker-stack.yml`:
+احفظ الملف التالي في مجلد المشروع على الـ **Master** باسم `.env`:
 
-> **مهم:** استبدل كل `100.x.x.1`، `100.x.x.2`، `100.x.x.3` بالـ IPs الحقيقية. استبدل `PC1`، `PC2`، `PC3` بالـ Hostnames الحقيقية.
+```env
+# Kaggle
+KAGGLE_USERNAME=your_kaggle_username
+KAGGLE_KEY=your_kaggle_api_key
+
+# Kafka
+KAFKA_BOOTSTRAP=kafka-1:29092,kafka-2:29093,kafka-3:29094
+KAFKA_TOPIC=us-stocks-raw
+KAFKA_DLT_TOPIC=us-stocks-dead-letter
+KAFKA_GROUP_ID=m1-validation-group
+
+# MinIO
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+MINIO_BUCKET=stocks
+
+# PostgreSQL
+POSTGRES_DB=stocks_analytics
+POSTGRES_USER=stocks
+POSTGRES_PASSWORD=stocks123
+
+# pgAdmin
+PGADMIN_DEFAULT_EMAIL=admin@stocks.com
+PGADMIN_DEFAULT_PASSWORD=admin123
+
+# Airflow
+AIRFLOW_SECRET_KEY=change-me-generate-with-python
+AIRFLOW_ADMIN_USER=admin
+AIRFLOW_ADMIN_PASSWORD=admin
+```
+
+لتوليد AIRFLOW_SECRET_KEY:
+
+```powershell
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+---
+
+## المرحلة 11 — ملف `docker-stack.yml`
+
+احفظ الملف التالي في مجلد المشروع على الـ Master باسم `docker-stack.yml`.
+
+**قبل الحفظ، استبدل هذه القيم:**
+
+| ما تستبدله | بـ ماذا |
+|---|---|
+| `MASTER_TAILSCALE_IP` | Tailscale IP للـ Master (مثال: `100.64.0.1`) |
+| `WORKER1_TAILSCALE_IP` | Tailscale IP لـ Worker 1 |
+| `WORKER2_TAILSCALE_IP` | Tailscale IP لـ Worker 2 |
+| `MASTER_HOSTNAME` | Hostname الـ Master من أمر `hostname` |
+| `WORKER1_HOSTNAME` | Hostname Worker 1 |
+| `WORKER2_HOSTNAME` | Hostname Worker 2 |
+| `C:\YOUR\PROJECT\PATH` | المسار الكامل لمجلد المشروع على الـ Master |
 
 ```yaml
-# docker-stack.yml — HA Setup: كل الأجهزة تشغّل كل شيء
-# Docker Swarm Stack — Real-Time US Stocks Data Pipeline
-# 3 Managers + Distributed Services
-
 version: "3.9"
+
+# ================================================================
+# Docker Swarm Stack — Real-Time US Stocks Data Pipeline
+# Layout:
+#   Master  → kafka-1, spark master, minio, postgres, producer,
+#              consumer, kafka-ui, pgadmin, airflow, kafka-init
+#   Worker1 → kafka-2, spark-worker
+#   Worker2 → kafka-3, spark-worker
+# ================================================================
 
 services:
 
-  # ════════════════════════════════════════════════════════
-  # KAFKA — كل broker على جهاز مختلف
-  # ════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
+  # KAFKA BROKERS
+  # كل broker على جهاز مختلف — RF=3 يضمن إن البيانات موجودة
+  # على الثلاثة أجهزة دائماً
+  # ─────────────────────────────────────────────────────────────
 
   kafka-1:
     image: confluentinc/cp-kafka:7.6.1
@@ -713,23 +560,25 @@ services:
         published: 9092
         mode: host
     environment:
-      KAFKA_NODE_ID:            1
-      CLUSTER_ID:               MkU3OEVBNTcwNTJENDM2Qk
-      KAFKA_PROCESS_ROLES:      broker,controller
-      KAFKA_LISTENERS:          CONTROLLER://0.0.0.0:29091,PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
-      # 100.x.x.1 = Tailscale IP لـ PC1
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:29092,PLAINTEXT_HOST://100.x.x.1:9092
+      KAFKA_NODE_ID:   1
+      CLUSTER_ID:      MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:29091,PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:29092,PLAINTEXT_HOST://MASTER_TAILSCALE_IP:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME:     PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES:      CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS:       1@kafka-1:29091,2@kafka-2:29091,3@kafka-3:29091
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR:         3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR:            2
-      KAFKA_DEFAULT_REPLICATION_FACTOR:               3
-      KAFKA_MIN_INSYNC_REPLICAS:                      2
-      KAFKA_NUM_PARTITIONS:                           6
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR:         "3"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR:            "2"
+      KAFKA_DEFAULT_REPLICATION_FACTOR:               "3"
+      KAFKA_MIN_INSYNC_REPLICAS:                      "2"
+      KAFKA_NUM_PARTITIONS:                           "6"
       KAFKA_AUTO_CREATE_TOPICS_ENABLE:                "false"
+      KAFKA_DELETE_TOPIC_ENABLE:                      "true"
+      KAFKA_LOG_RETENTION_HOURS:                      "168"
+      KAFKA_COMPRESSION_TYPE:                         lz4
       KAFKA_LOG_DIRS:                                 /var/lib/kafka/data
     volumes:
       - kafka-1-data:/var/lib/kafka/data
@@ -738,7 +587,6 @@ services:
       replicas: 1
       placement:
         constraints:
-          # Kafka-1 دائماً على PC1 (node1)
           - node.labels.kafka.broker == 1
       restart_policy:
         condition: on-failure
@@ -754,23 +602,25 @@ services:
         published: 9093
         mode: host
     environment:
-      KAFKA_NODE_ID:            2
-      CLUSTER_ID:               MkU3OEVBNTcwNTJENDM2Qk
-      KAFKA_PROCESS_ROLES:      broker,controller
-      KAFKA_LISTENERS:          CONTROLLER://0.0.0.0:29091,PLAINTEXT://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9093
-      # 100.x.x.2 = Tailscale IP لـ PC2
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:29093,PLAINTEXT_HOST://100.x.x.2:9093
+      KAFKA_NODE_ID:   2
+      CLUSTER_ID:      MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:29091,PLAINTEXT://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:29093,PLAINTEXT_HOST://WORKER1_TAILSCALE_IP:9093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME:     PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES:      CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS:       1@kafka-1:29091,2@kafka-2:29091,3@kafka-3:29091
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR:         3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR:            2
-      KAFKA_DEFAULT_REPLICATION_FACTOR:               3
-      KAFKA_MIN_INSYNC_REPLICAS:                      2
-      KAFKA_NUM_PARTITIONS:                           6
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR:         "3"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR:            "2"
+      KAFKA_DEFAULT_REPLICATION_FACTOR:               "3"
+      KAFKA_MIN_INSYNC_REPLICAS:                      "2"
+      KAFKA_NUM_PARTITIONS:                           "6"
       KAFKA_AUTO_CREATE_TOPICS_ENABLE:                "false"
+      KAFKA_DELETE_TOPIC_ENABLE:                      "true"
+      KAFKA_LOG_RETENTION_HOURS:                      "168"
+      KAFKA_COMPRESSION_TYPE:                         lz4
       KAFKA_LOG_DIRS:                                 /var/lib/kafka/data
     volumes:
       - kafka-2-data:/var/lib/kafka/data
@@ -794,23 +644,25 @@ services:
         published: 9094
         mode: host
     environment:
-      KAFKA_NODE_ID:            3
-      CLUSTER_ID:               MkU3OEVBNTcwNTJENDM2Qk
-      KAFKA_PROCESS_ROLES:      broker,controller
-      KAFKA_LISTENERS:          CONTROLLER://0.0.0.0:29091,PLAINTEXT://0.0.0.0:29094,PLAINTEXT_HOST://0.0.0.0:9094
-      # 100.x.x.3 = Tailscale IP لـ PC3
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:29094,PLAINTEXT_HOST://100.x.x.3:9094
+      KAFKA_NODE_ID:   3
+      CLUSTER_ID:      MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:29091,PLAINTEXT://0.0.0.0:29094,PLAINTEXT_HOST://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:29094,PLAINTEXT_HOST://WORKER2_TAILSCALE_IP:9094
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME:     PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES:      CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS:       1@kafka-1:29091,2@kafka-2:29091,3@kafka-3:29091
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR:         3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR:            2
-      KAFKA_DEFAULT_REPLICATION_FACTOR:               3
-      KAFKA_MIN_INSYNC_REPLICAS:                      2
-      KAFKA_NUM_PARTITIONS:                           6
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR:         "3"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR:            "2"
+      KAFKA_DEFAULT_REPLICATION_FACTOR:               "3"
+      KAFKA_MIN_INSYNC_REPLICAS:                      "2"
+      KAFKA_NUM_PARTITIONS:                           "6"
       KAFKA_AUTO_CREATE_TOPICS_ENABLE:                "false"
+      KAFKA_DELETE_TOPIC_ENABLE:                      "true"
+      KAFKA_LOG_RETENTION_HOURS:                      "168"
+      KAFKA_COMPRESSION_TYPE:                         lz4
       KAFKA_LOG_DIRS:                                 /var/lib/kafka/data
     volumes:
       - kafka-3-data:/var/lib/kafka/data
@@ -825,6 +677,10 @@ services:
         delay: 15s
         max_attempts: 5
 
+  # ─────────────────────────────────────────────────────────────
+  # KAFKA INIT — ينشئ الـ Topics مرة واحدة ثم يخرج
+  # ─────────────────────────────────────────────────────────────
+
   kafka-init:
     image: confluentinc/cp-kafka:7.6.1
     networks:
@@ -833,33 +689,36 @@ services:
     command:
       - |
         set -e
-        echo 'Waiting 60s for all Kafka brokers to be ready...'
+        echo '--------------------------------------------------'
+        echo 'Waiting 60s for all 3 brokers to elect leaders...'
+        echo '--------------------------------------------------'
         sleep 60
-        echo 'Creating topics...'
+        echo 'Creating topic: us-stocks-raw'
         kafka-topics --bootstrap-server kafka-1:29092 --create --if-not-exists \
           --topic us-stocks-raw --partitions 6 --replication-factor 3 \
           --config retention.ms=604800000 \
           --config compression.type=lz4 \
           --config min.insync.replicas=2
+        echo 'Creating topic: us-stocks-dead-letter'
         kafka-topics --bootstrap-server kafka-1:29092 --create --if-not-exists \
           --topic us-stocks-dead-letter --partitions 3 --replication-factor 3 \
           --config retention.ms=2592000000 \
           --config compression.type=lz4
-        echo 'Topics:'
+        echo 'All topics:'
         kafka-topics --bootstrap-server kafka-1:29092 --list
-        echo 'Done.'
+        echo 'Topics ready. Done.'
     deploy:
       mode: replicated
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: none
 
-  # ════════════════════════════════════════════════════════
-  # KAFKA UI — على كل الأجهزة (replicas=3)
-  # ════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
+  # KAFKA UI
+  # ─────────────────────────────────────────────────────────────
 
   kafka-ui:
     image: ghcr.io/kafbat/kafka-ui:latest
@@ -872,19 +731,20 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME:             us-stocks-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
-      KAFKA_CLUSTERS_0_AUDIT_TOPICAUDITENABLED: "false"
-      DYNAMIC_CONFIG_ENABLED: "true"
+      DYNAMIC_CONFIG_ENABLED:            "true"
     deploy:
-      mode: global    # نسخة على كل جهاز
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.role == master
       restart_policy:
         condition: on-failure
         delay: 10s
 
-  # ════════════════════════════════════════════════════════
-  # MINIO — على كل الأجهزة للـ Read Access (Primary على PC1)
-  # ════════════════════════════════════════════════════════
-  # ملاحظة: MinIO في هذا الإعداد يكتب على PC1 فقط عبر الـ Shared Volume
-  # الـ replicas على PC2/PC3 تقرأ من نفس الـ Volume
+  # ─────────────────────────────────────────────────────────────
+  # MINIO
+  # ─────────────────────────────────────────────────────────────
 
   minio:
     image: elestio/minio:latest
@@ -908,7 +768,7 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: on-failure
         delay: 10s
@@ -925,7 +785,7 @@ services:
       - |
         set -e
         sleep 15
-        mc alias set local http://minio:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+        mc alias set local http://minio:9000 "$${MINIO_ACCESS_KEY}" "$${MINIO_SECRET_KEY}"
         mc mb --ignore-existing local/stocks
         echo 'Bucket stocks is ready.'
     deploy:
@@ -933,14 +793,13 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: none
 
-  # ════════════════════════════════════════════════════════
-  # POSTGRESQL — Primary على PC1
-  # Standby نسخة احتياطية على PC2 (يدوياً عند الحاجة)
-  # ════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
+  # POSTGRESQL
+  # ─────────────────────────────────────────────────────────────
 
   postgres:
     image: postgres:16
@@ -963,15 +822,15 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.labels.postgres.role == primary
+          - node.labels.role == master
       restart_policy:
         condition: on-failure
         delay: 15s
         max_attempts: 10
 
-  # ════════════════════════════════════════════════════════
-  # SPARK — Master على PC1، Workers على كل الأجهزة
-  # ════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
+  # SPARK MASTER
+  # ─────────────────────────────────────────────────────────────
 
   spark:
     image: stocks-spark:3.5.7
@@ -997,19 +856,23 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stocks123}
     volumes:
       - type: bind
-        source: C:\path\to\your\project\spark
+        source: C:\YOUR\PROJECT\PATH\spark
         target: /opt/spark/work-dir
     deploy:
       mode: replicated
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: on-failure
         delay: 10s
 
-  spark-worker:
+  # ─────────────────────────────────────────────────────────────
+  # SPARK WORKERS — واحد على كل Worker
+  # ─────────────────────────────────────────────────────────────
+
+  spark-worker-1:
     image: stocks-spark:3.5.7
     networks:
       - stocks-net
@@ -1031,17 +894,55 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stocks123}
     volumes:
       - type: bind
-        source: C:\path\to\your\project\spark
+        source: C:\YOUR\PROJECT\PATH\spark
         target: /opt/spark/work-dir
     deploy:
-      mode: global      # Spark Worker على كل جهاز
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.kafka.broker == 2
       restart_policy:
         condition: on-failure
         delay: 10s
 
-  # ════════════════════════════════════════════════════════
-  # PRODUCER & CONSUMER — على PC1 فقط
-  # ════════════════════════════════════════════════════════
+  spark-worker-2:
+    image: stocks-spark:3.5.7
+    networks:
+      - stocks-net
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark:7077
+    environment:
+      SPARK_WORKER_MEMORY: 4g
+      SPARK_WORKER_CORES:  4
+      MINIO_ENDPOINT:    http://minio:9000
+      MINIO_ACCESS_KEY:  ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY:  ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET:      ${MINIO_BUCKET:-stocks}
+      POSTGRES_HOST:     postgres
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB:-stocks_analytics}
+      POSTGRES_USER:     ${POSTGRES_USER:-stocks}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stocks123}
+    volumes:
+      - type: bind
+        source: C:\YOUR\PROJECT\PATH\spark
+        target: /opt/spark/work-dir
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.kafka.broker == 3
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+
+  # ─────────────────────────────────────────────────────────────
+  # PRODUCER & CONSUMER
+  # ─────────────────────────────────────────────────────────────
 
   producer:
     image: stocks-python:latest
@@ -1063,14 +964,14 @@ services:
       - /app/Stock_List.csv
     volumes:
       - type: bind
-        source: C:\path\to\your\project\kafka
+        source: C:\YOUR\PROJECT\PATH\kafka
         target: /app
     deploy:
       mode: replicated
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: on-failure
         delay: 10s
@@ -1094,21 +995,21 @@ services:
       - "180"
     volumes:
       - type: bind
-        source: C:\path\to\your\project\kafka
+        source: C:\YOUR\PROJECT\PATH\kafka
         target: /app
     deploy:
       mode: replicated
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: on-failure
         delay: 10s
 
-  # ════════════════════════════════════════════════════════
-  # PGADMIN — على PC1
-  # ════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
+  # PGADMIN
+  # ─────────────────────────────────────────────────────────────
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -1126,14 +1027,13 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: on-failure
-        delay: 10s
 
-  # ════════════════════════════════════════════════════════
-  # AIRFLOW — على PC1
-  # ════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
+  # AIRFLOW
+  # ─────────────────────────────────────────────────────────────
 
   postgres-airflow:
     image: postgres:16
@@ -1150,10 +1050,9 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: on-failure
-        delay: 10s
 
   airflow-init:
     image: stocks-airflow:2.10.4
@@ -1180,7 +1079,7 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: none
 
@@ -1195,7 +1094,7 @@ services:
     environment: *airflow-env
     volumes:
       - type: bind
-        source: C:\path\to\your\project\dags
+        source: C:\YOUR\PROJECT\PATH\dags
         target: /opt/airflow/dags
       - airflow-logs:/opt/airflow/logs
       - airflow-plugins:/opt/airflow/plugins
@@ -1205,7 +1104,7 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: on-failure
         delay: 15s
@@ -1217,7 +1116,7 @@ services:
     environment: *airflow-env
     volumes:
       - type: bind
-        source: C:\path\to\your\project\dags
+        source: C:\YOUR\PROJECT\PATH\dags
         target: /opt/airflow/dags
       - airflow-logs:/opt/airflow/logs
       - airflow-plugins:/opt/airflow/plugins
@@ -1227,24 +1126,22 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.labels.nodeid == node1
+          - node.labels.role == master
       restart_policy:
         condition: on-failure
         delay: 15s
 
-# ════════════════════════════════════════════════════════
+# ================================================================
 # NETWORKS
-# ════════════════════════════════════════════════════════
+# ================================================================
 
 networks:
   stocks-net:
     external: true
 
-# ════════════════════════════════════════════════════════
-# VOLUMES — تشير لـ Shared Storage على PC1 عبر SMB
-# ════════════════════════════════════════════════════════
-# ملاحظة: هذه الـ Volumes يجب أن تكون مُنشأة مسبقاً على كل جهاز
-# (راجع مرحلة 4 الخطوة 6.5)
+# ================================================================
+# VOLUMES — كلها external (أنشأناها في مرحلة 7)
+# ================================================================
 
 volumes:
   kafka-1-data:
@@ -1267,66 +1164,34 @@ volumes:
 
 ---
 
-## 9. مرحلة 7 — Deploy
+## المرحلة 12 — Deploy الـ Stack
 
-### الخطوة 9.1 — تحضير ملف .env على PC1
-
-في مجلد المشروع على PC1، أنشئ أو عدّل ملف `.env`:
-
-```env
-# Kaggle
-KAGGLE_USERNAME=your_kaggle_username
-KAGGLE_KEY=your_kaggle_api_key
-
-# Kafka
-KAFKA_BOOTSTRAP=localhost:9092,localhost:9093,localhost:9094
-KAFKA_TOPIC=us-stocks-raw
-KAFKA_DLT_TOPIC=us-stocks-dead-letter
-KAFKA_GROUP_ID=m1-validation-group
-
-# MinIO
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin
-MINIO_BUCKET=stocks
-
-# PostgreSQL
-POSTGRES_DB=stocks_analytics
-POSTGRES_USER=stocks
-POSTGRES_PASSWORD=stocks123
-
-# pgAdmin
-PGADMIN_DEFAULT_EMAIL=admin@stocks.com
-PGADMIN_DEFAULT_PASSWORD=admin123
-
-# Airflow
-AIRFLOW_SECRET_KEY=your-random-secret-key-here
-AIRFLOW_ADMIN_USER=admin
-AIRFLOW_ADMIN_PASSWORD=admin
-```
-
-لتوليد AIRFLOW_SECRET_KEY:
+### الخطوة 12.1 — تأكد من كل حاجة قبل الـ Deploy
 
 ```powershell
-python -c "import secrets; print(secrets.token_hex(32))"
+# على الـ MASTER
+
+# 1. كل الـ Nodes متصلة
+docker node ls
+
+# 2. الـ Network موجودة
+docker network ls | Select-String stocks-net
+
+# 3. الـ Volumes موجودة
+docker volume ls | Select-String -Pattern "kafka|minio|postgres|airflow"
+
+# 4. الـ Images موجودة
+docker images | Select-String "stocks"
+
+# 5. ملف .env موجود
+Get-Content .env
 ```
 
-### الخطوة 9.2 — عدّل المسارات في docker-stack.yml
-
-افتح `docker-stack.yml` وابحث عن كل `C:\path\to\your\project` واستبدلها بالمسار الحقيقي، مثلاً:
-
-```yaml
-source: C:\Users\Mohamed\Desktop\stocks-pipeline\spark
-```
-
-وأيضاً استبدل كل `100.x.x.1`، `100.x.x.2`، `100.x.x.3` بالـ IPs الحقيقية.
-
-وكل `PC1`، `PC2`، `PC3` بالـ Hostnames الحقيقية من أمر `hostname`.
-
-### الخطوة 9.3 — Deploy الـ Stack
+### الخطوة 12.2 — Deploy
 
 ```powershell
-# على PC1 — في مجلد المشروع
-cd C:\path\to\your\project
+# على الـ MASTER — في مجلد المشروع
+cd C:\YOUR\PROJECT\PATH
 
 docker stack deploy `
     --compose-file docker-stack.yml `
@@ -1334,124 +1199,68 @@ docker stack deploy `
     stocks
 ```
 
-### الخطوة 9.4 — تابع الـ Deploy
+### الخطوة 12.3 — تابع الـ Deploy
 
 ```powershell
 # شوف حالة كل الـ Services
 docker stack services stocks
 
-# شوف على أنهي جهاز نزلت كل service
+# شوف على أنهي جهاز كل container
 docker stack ps stocks
 
-# لو عايز تتابع بشكل مستمر
-while ($true) {
-    Clear-Host
-    docker stack services stocks
-    Start-Sleep -Seconds 5
-}
-```
-
-### الخطوة 9.5 — انتظر حتى يكتمل كل شيء
-
-قد يأخذ هذا 3-5 دقائق. تحقق من كل service إنها `1/1` في عمود `REPLICAS`.
-
----
-
-## 10. مرحلة 8 — اختبار الـ Failover
-
-### اختبار 1 — وقوع PC1
-
-```powershell
-# من PC2 — قبل الاختبار، تحقق من Leader
-docker node ls
-
-# أوقف Docker Desktop على PC1 (أو افصل الـ Network)
-# أو من PC1 نفسه:
-# docker swarm leave --force
-
-# من PC2 بعد 30 ثانية
-docker node ls
-# هتشوف PC2 أو PC3 أصبح Leader
-
-# تحقق من أن Kafka لا تزال تعمل
-docker exec -it `
-    $(docker ps -q -f "name=stocks_kafka-2") `
-    kafka-topics --bootstrap-server kafka-2:29093 --list
-```
-
-### اختبار 2 — وقوع Kafka Broker
-
-Kafka RF=3 مع min.insync.replicas=2 يعني إن الـ cluster يكمل حتى لو وقع broker واحد:
-
-```powershell
-# من أي جهاز
-# أوقف container kafka-1 (مثلاً)
-docker service scale stocks_kafka-1=0
-
-# انتظر 30 ثانية
-Start-Sleep -Seconds 30
-
-# تحقق إن الـ Topic لا تزال تعمل عبر kafka-2 وkafka-3
-docker exec -it `
-    $(docker ps -q -f "name=stocks_kafka-2") `
-    kafka-topics `
-    --bootstrap-server kafka-2:29093,kafka-3:29094 `
-    --describe --topic us-stocks-raw
-
-# أعد تشغيل kafka-1
-docker service scale stocks_kafka-1=1
-```
-
-### اختبار 3 — وقوع PostgreSQL والاسترداد
-
-```powershell
-# أوقف postgres
-docker service scale stocks_postgres=0
-
-# انتظر 10 ثواني ثم أعد تشغيله
-Start-Sleep -Seconds 10
-docker service scale stocks_postgres=1
-
-# تحقق إن البيانات لم تُفقد
-docker exec -it `
-    $(docker ps -q -f "name=stocks_postgres") `
-    psql -U stocks -d stocks_analytics -c "SELECT COUNT(*) FROM stock_summary;"
+# تابع بشكل مستمر (Ctrl+C للخروج)
+while ($true) { Clear-Host; docker stack services stocks; Start-Sleep 5 }
 ```
 
 ---
 
-## 11. الـ URLs والـ Ports بعد الـ Deploy
+## المرحلة 13 — التحقق النهائي
 
-| Service | URL (من أي جهاز) | Login |
-|---|---|---|
-| Kafka UI | http://100.x.x.1:8080 أو http://100.x.x.2:8080 أو http://100.x.x.3:8080 | لا يوجد |
-| Spark Master UI | http://100.x.x.1:8081 | لا يوجد |
-| MinIO Console | http://100.x.x.1:9001 | minioadmin / minioadmin |
-| MinIO S3 API | http://100.x.x.1:9000 | — |
-| pgAdmin | http://100.x.x.1:5050 | admin@stocks.com / admin123 |
-| Airflow UI | http://100.x.x.1:8082 | admin / admin |
-| PostgreSQL | 100.x.x.1:5432 | stocks / stocks123 |
-| Kafka Broker 1 | 100.x.x.1:9092 | — |
-| Kafka Broker 2 | 100.x.x.2:9093 | — |
-| Kafka Broker 3 | 100.x.x.3:9094 | — |
-
-### أوامر Spark Submit بعد الـ Deploy
+### الخطوة 13.1 — تحقق من Kafka
 
 ```powershell
-# Streaming Job
-docker exec -it `
-    $(docker ps -q -f "name=stocks_spark") `
+# اعرف ID الـ kafka-1 container
+$KAFKA1 = docker ps --filter "name=stocks_kafka-1" --format "{{.ID}}"
+
+# تحقق من الـ Topics
+docker exec $KAFKA1 kafka-topics `
+    --bootstrap-server kafka-1:29092,kafka-2:29093,kafka-3:29094 `
+    --list
+
+# تحقق من الـ Brokers
+docker exec $KAFKA1 kafka-broker-api-versions `
+    --bootstrap-server kafka-1:29092,kafka-2:29093,kafka-3:29094
+```
+
+### الخطوة 13.2 — تحقق من Spark
+
+افتح في المتصفح:
+- **Spark Master UI:** `http://MASTER_TAILSCALE_IP:8081`
+- يجب أن ترى Workers: 2 (واحد من Worker1، واحد من Worker2)
+
+### الخطوة 13.3 — شغّل Spark Streaming Job
+
+```powershell
+# على الـ MASTER
+$SPARK = docker ps --filter "name=stocks_spark" --format "{{.ID}}"
+
+docker exec -it $SPARK `
     /opt/spark/bin/spark-submit `
     --master spark://spark:7077 `
     --conf spark.jars.ivy=/tmp/.ivy2 `
     /opt/spark/work-dir/streaming_job.py
+```
 
-# Analytics Job
-docker exec -it `
-    $(docker ps -q -f "name=stocks_spark") `
+### الخطوة 13.4 — شغّل Analytics Job
+
+```powershell
+$SPARK = docker ps --filter "name=stocks_spark" --format "{{.ID}}"
+
+docker exec -it $SPARK `
     /opt/spark/bin/spark-submit `
     --master local[4] `
     --conf spark.jars.ivy=/tmp/.ivy2 `
+    --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem `
     --conf "spark.hadoop.fs.s3a.endpoint=http://minio:9000" `
     --conf spark.hadoop.fs.s3a.path.style.access=true `
     --conf spark.hadoop.fs.s3a.access.key=minioadmin `
@@ -1460,161 +1269,203 @@ docker exec -it `
     /opt/spark/work-dir/analytics_job.py
 ```
 
+### الخطوة 13.5 — طبّق post_analytics.sql
+
+```powershell
+$PG = docker ps --filter "name=stocks_postgres" --format "{{.ID}}"
+
+docker cp spark\post_analytics.sql ${PG}:/tmp/post_analytics.sql
+docker exec $PG psql -U stocks -d stocks_analytics -f /tmp/post_analytics.sql
+```
+
 ---
 
-## 12. Troubleshooting
+## 🌐 الـ URLs بعد الـ Deploy
 
-### المشكلة 1 — `docker swarm join` فاشل
+| Service | URL | Login |
+|---|---|---|
+| Kafka UI | `http://MASTER_TAILSCALE_IP:8080` | لا يوجد |
+| Spark Master UI | `http://MASTER_TAILSCALE_IP:8081` | لا يوجد |
+| MinIO Console | `http://MASTER_TAILSCALE_IP:9001` | minioadmin / minioadmin |
+| pgAdmin | `http://MASTER_TAILSCALE_IP:5050` | admin@stocks.com / admin123 |
+| Airflow UI | `http://MASTER_TAILSCALE_IP:8082` | admin / admin |
+| PostgreSQL | `MASTER_TAILSCALE_IP:5432` | stocks / stocks123 |
+
+> يمكن الوصول لهذه الـ URLs من أي من الأجهزة الثلاثة عبر Tailscale.
+
+---
+
+## 🔧 أوامر مفيدة للمراقبة والإدارة
 
 ```powershell
-# تحقق إن الـ Port 2377 مفتوح
-Test-NetConnection -ComputerName 100.x.x.1 -Port 2377
+# ── حالة الـ Cluster ────────────────────────────────────
+# كل الـ Nodes وحالتها
+docker node ls
 
-# لو مسدود، تحقق من الـ Firewall
-netsh advfirewall firewall show rule name="Docker Swarm Port 2377"
+# كل الـ Services وعدد الـ Replicas
+docker stack services stocks
 
-# لو مش موجود، أضفه مجدداً
-netsh advfirewall firewall add rule name="Docker Swarm Port 2377" dir=in action=allow protocol=TCP localport=2377 remoteip=100.0.0.0/8
+# كل الـ Containers وعلى أنهي جهاز
+docker stack ps stocks
+
+# الـ Containers الـ Failed أو المتوقفة
+docker stack ps stocks --filter "desired-state=failed"
+
+# ── Logs ────────────────────────────────────────────────
+# Logs أي service (آخر 50 سطر)
+docker service logs stocks_kafka-1 --tail 50
+
+# Logs بشكل مستمر
+docker service logs stocks_kafka-1 -f
+
+# Logs الـ producer
+docker service logs stocks_producer -f
+
+# ── إدارة الـ Services ──────────────────────────────────
+# أوقف service مؤقتاً
+docker service scale stocks_consumer=0
+
+# أعد تشغيل service
+docker service scale stocks_consumer=1
+
+# أعد تشغيل service بالقوة (force redeploy)
+docker service update --force stocks_producer
+
+# Update image لـ service
+docker service update --image stocks-python:latest stocks_producer
+
+# ── إيقاف كل شيء ────────────────────────────────────────
+# إيقاف الـ Stack (الـ Volumes والبيانات تبقى)
+docker stack rm stocks
+
+# إعادة Deploy من الأول
+docker stack deploy --compose-file docker-stack.yml --with-registry-auth stocks
 ```
 
-### المشكلة 2 — Service عالق في `Pending`
+---
+
+## 🐛 Troubleshooting
+
+### المشكلة: Worker لا يستطيع الانضمام للـ Swarm
 
 ```powershell
-# شوف السبب التفصيلي
-docker service ps stocks_kafka-1 --no-trunc
+# على الـ Worker
+# أولاً تحقق من الاتصال بـ Master
+Test-NetConnection -ComputerName MASTER_TAILSCALE_IP -Port 2377
 
-# الأسباب الشائعة:
-# أ) الـ Image مش موجودة
+# لو فاشل، تحقق من الـ Firewall على الـ Master
+netsh advfirewall firewall show rule name="Swarm-2377"
+
+# لو مش موجود، أضفه على الـ Master
+netsh advfirewall firewall add rule name="Swarm-2377" dir=in action=allow protocol=TCP localport=2377 remoteip=100.0.0.0/8
+
+# على الـ Worker، جرّب مجدداً
+docker swarm join --token TOKEN MASTER_TAILSCALE_IP:2377
+```
+
+### المشكلة: Service عالق في Pending
+
+```powershell
+# اعرف السبب
+docker service ps stocks_SERVICENAME --no-trunc
+
+# السبب الأكثر شيوعاً — Image مش موجودة على الـ Node
+# على الـ Node المحدد
 docker images | Select-String "stocks"
 
-# ب) مشكلة في الـ Volume
-docker volume ls
-docker volume inspect minio-data
+# لو مش موجودة، حمّلها
+docker pull 100.x.x.1:5000/stocks-spark:3.5.7
+docker tag 100.x.x.1:5000/stocks-spark:3.5.7 stocks-spark:3.5.7
 
-# ج) الـ Label غلط
-docker node inspect PC1 --format "{{ .Spec.Labels }}"
-# لو فيه مشكلة:
-docker node update --label-add kafka.broker=1 PC1
+# سبب آخر — Label غلط
+docker node inspect WORKER1_HOSTNAME --format "{{ .Spec.Labels }}"
+# أصلح الـ Labels
+docker node update --label-add kafka.broker=2 WORKER1_HOSTNAME
 ```
 
-### المشكلة 3 — Kafka Brokers مش بتتواصل
+### المشكلة: Kafka Brokers مش بيتواصلوا
 
 ```powershell
-# تحقق إن الـ Overlay Network شغّال
-docker network inspect stocks-net
+# تحقق من DNS داخل الـ Overlay Network
+docker run --rm --network stocks-net alpine nslookup kafka-1
+docker run --rm --network stocks-net alpine nslookup kafka-2
+docker run --rm --network stocks-net alpine nslookup kafka-3
 
-# تحقق من DNS داخل الـ Network
-docker run --rm --network stocks-net `
-    busybox nslookup kafka-1
-
-docker run --rm --network stocks-net `
-    busybox nslookup kafka-2
+# تحقق من الـ Advertised Listeners في الـ docker-stack.yml
+# تأكد إن كل broker يستخدم الـ Tailscale IP الصحيح
+# kafka-1 → MASTER_TAILSCALE_IP
+# kafka-2 → WORKER1_TAILSCALE_IP
+# kafka-3 → WORKER2_TAILSCALE_IP
 ```
 
-### المشكلة 4 — SMB Volume بيفشل
+### المشكلة: SMB Volume لا يعمل
 
 ```powershell
-# تحقق من الـ Share على PC1
-net share stocks-data
+# تحقق من الـ Share على الـ Master
+Get-SmbShare -Name "stocks-data"
 
-# تحقق من الوصول
-net use \\100.x.x.1\stocks-data /user:PC1_USERNAME PC1_PASSWORD
+# اختبر الوصول من الـ Worker
+Test-NetConnection -ComputerName MASTER_TAILSCALE_IP -Port 445
 
-# لو في مشكلة credentials:
-# روح لـ Control Panel → Credential Manager → Windows Credentials
-# أضف: \\100.x.x.1 مع الـ Username وPassword
+# جرّب Mount يدوي
+net use Z: \\MASTER_TAILSCALE_IP\stocks-data /user:MASTER_USERNAME MASTER_PASSWORD
+
+# لو في مشكلة credentials في Docker Volume
+# أضف الـ Credentials لـ Windows Credential Manager
+cmdkey /add:MASTER_TAILSCALE_IP /user:MASTER_USERNAME /pass:MASTER_PASSWORD
 ```
 
-### المشكلة 5 — Docker Desktop لا يبدأ على Windows
+### المشكلة: Docker Desktop لا يبدأ
 
 ```powershell
 # تحقق من WSL2
 wsl --list --verbose
 
-# لو Ubuntu مش running
-wsl --set-version Ubuntu-22.04 2
+# أعد تشغيل WSL
+wsl --shutdown
 wsl -d Ubuntu-22.04
 
-# أعد تشغيل Docker Desktop service
-Restart-Service -Name "com.docker.service" -Force
+# أعد تشغيل Docker service
+net stop com.docker.service
+net start com.docker.service
 ```
 
-### المشكلة 6 — Tailscale IP يتغير
-
-Tailscale IPs ثابتة ولا تتغير ما دمت في نفس الـ Tailnet. لكن لو حذفت الجهاز وأضفته مجدداً، قد تحصل على IP مختلف. الحل: استخدم **Tailscale MagicDNS** بدل الـ IPs:
-
-```
-# بدل 100.x.x.1 استخدم اسم الجهاز:
-PC1.tail12345.ts.net
-PC2.tail12345.ts.net
-PC3.tail12345.ts.net
-```
-
-اكتشف الـ DNS name:
+### المشكلة: Tailscale يفقد الاتصال
 
 ```powershell
+# تحقق من حالة Tailscale
 & "C:\Program Files\Tailscale\tailscale.exe" status
-# هتلاقي الـ DNS names في الأعمدة
-```
 
-### المشكلة 7 — Spark Worker لا يتصل بـ Spark Master
-
-```powershell
-# تحقق إن الـ spark service موجود في الـ DNS
-docker run --rm --network stocks-net `
-    busybox nslookup spark
-
-# تحقق من الـ Port
-docker run --rm --network stocks-net `
-    busybox nc -zv spark 7077
-```
-
-### أوامر المراقبة اليومية
-
-```powershell
-# حالة كل الـ Nodes
-docker node ls
-
-# حالة كل الـ Services
-docker stack services stocks
-
-# حالة كل الـ Containers وعلى أنهي جهاز
-docker stack ps stocks
-
-# Logs أي service
-docker service logs stocks_kafka-1 -f --tail 50
-
-# إيقاف كل شيء
-docker stack rm stocks
-
-# Scale service معين
-docker service scale stocks_spark-worker=2
-
-# Update image
-docker service update --image stocks-spark:3.5.7-new stocks_spark
+# أعد الاتصال
+& "C:\Program Files\Tailscale\tailscale.exe" down
+& "C:\Program Files\Tailscale\tailscale.exe" up
 ```
 
 ---
 
-## 📝 ملاحظات ختامية
+## 📊 جدول توزيع الـ Services
 
-### ما يحدث عند وقوع كل جهاز
-
-| الجهاز الذي يقع | التأثير | الاسترداد |
-|---|---|---|
-| PC1 | kafka-1 يتوقف، postgres يتوقف، minio يتوقف، spark master يتوقف | Kafka يكمل مع broker 2+3، Swarm يعيّن Leader جديد. تحتاج تبدأ postgres وminio يدوياً على PC2 |
-| PC2 | kafka-2 يتوقف | Kafka يكمل مع broker 1+3 (RF=3، min.insync=2) |
-| PC3 | kafka-3 يتوقف | Kafka يكمل مع broker 1+2 |
-| أي جهازين في نفس الوقت | الـ Cluster يتجمّد (لا يقبل تغييرات) | أعد تشغيل أحد الجهازين |
-
-### نصائح مهمة
-
-1. **لا تُطفئ أكثر من جهاز واحد في نفس الوقت** — الـ Quorum يحتاج أغلبية.
-2. **احفظ الـ Join Token** في مكان آمن — ستحتاجه لو أضفت جهازاً جديداً.
-3. **تأكد من أن Tailscale شغّال دائماً** — هو شريان الحياة للـ Cluster.
-4. **البيانات محفوظة على PC1** — في `C:\stocks-data`. خذ backup منها بانتظام.
-5. **إذا انتقل الـ Leader** من PC1 لجهاز آخر، ستلاحظ إن MinIO وPostgres مش شغّالين لأنهم متقيدين بـ PC1. الحل المؤقت: شغّل docker service update لتغيير الـ Constraint.
+| Service | Master | Worker 1 | Worker 2 |
+|---|---|---|---|
+| kafka-1 | ✅ | | |
+| kafka-2 | | ✅ | |
+| kafka-3 | | | ✅ |
+| kafka-init | ✅ | | |
+| kafka-ui | ✅ | | |
+| minio | ✅ | | |
+| minio-init | ✅ | | |
+| postgres | ✅ | | |
+| spark (master) | ✅ | | |
+| spark-worker-1 | | ✅ | |
+| spark-worker-2 | | | ✅ |
+| producer | ✅ | | |
+| consumer | ✅ | | |
+| pgadmin | ✅ | | |
+| postgres-airflow | ✅ | | |
+| airflow-init | ✅ | | |
+| airflow-webserver | ✅ | | |
+| airflow-scheduler | ✅ | | |
 
 ---
 
-*تاريخ الإنشاء: September 2026 | Real-Time US Stocks Data Pipeline — HA Cluster Guide*
+*تاريخ الإنشاء: September 2026 | Real-Time US Stocks Data Pipeline*
