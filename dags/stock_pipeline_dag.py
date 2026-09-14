@@ -341,11 +341,11 @@ with DAG(
     # math needed). start_date's time-of-day (15:00) is just the anchor point
     # cron intervals are calculated from; with catchup=False the first actual
     # run fires at the next 5-minute mark after the DAG is unpaused, and every
-    # 5 minutes after that, day after day.
-    schedule="*/5 * * * *",
+    # 10 minutes after that, day after day.
+    schedule="*/10 * * * *",
     start_date=pendulum.datetime(2026, 1, 1, 15, 0, tz="Africa/Cairo"),
     catchup=False,
-    dagrun_timeout=timedelta(minutes=5),
+    dagrun_timeout=timedelta(minutes=10),
     max_active_runs=1,          # never let two pipeline runs overlap — if a
                                  # run takes longer than 5 min, the next one
                                  # queues behind it instead of running in
