@@ -1,56 +1,146 @@
-# 📈 Real-Time US Stocks Data Pipeline
+<!-- ══════════════════════════════════════════════════════════════════════════════
+     📈  Real-Time US Stocks Data Pipeline — README
+     Streaming Data Engineering · Apache Kafka · Apache Spark · MinIO · PostgreSQL
+     · Apache Airflow · Machine Learning · RAG
+     ══════════════════════════════════════════════════════════════════════════════ -->
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Apache%20Kafka-231F20?style=for-the-badge&logo=apachekafka&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Apache%20Spark-E25A1C?style=for-the-badge&logo=apachespark&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Apache%20Airflow-017CEE?style=for-the-badge&logo=apacheairflow&logoColor=white"/>
-  <img src="https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white"/>
-  <img src="https://img.shields.io/badge/MinIO-C72E49?style=for-the-badge&logo=minio&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Power%20BI-F2C811?style=for-the-badge&logo=powerbi&logoColor=black"/>
-  <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white"/>
+<div align="center">
+
+<a id="top"></a>
+
+<h1>📈 Real-Time US Stocks Data Pipeline</h1>
+
+<a href="https://git.io/typing-svg"><img src="https://readme-typing-svg.demolab.com?font=JetBrains+Mono&weight=700&size=30&duration=3000&pause=800&color=2E9BFF&center=true&vCenter=true&multiline=false&repeat=true&width=900&height=60&lines=Real-Time+US+Stocks+Data+Pipeline;Kaggle+%E2%86%92+Kafka+%E2%86%92+Spark+%E2%86%92+MinIO+%E2%86%92+PostgreSQL;Streaming+%C3%97+Analytics+%C3%97+Machine+Learning+%C3%97+RAG;Orchestrated+End-to-End+with+Apache+Airflow" alt="Typing SVG" /></a>
+
+<br/>
+
+<strong>An end-to-end, production-grade streaming data engineering pipeline</strong><br/>
+combining Event Streaming · Distributed Processing · Analytical Warehousing · Machine Learning · Generative AI
+
+<br/>
+
+<p><sub><b>DATA SOURCE</b></sub></p>
+<p>
+  <img src="https://img.shields.io/badge/Kaggle-20BEFF?style=for-the-badge&logo=kaggle&logoColor=white" alt="Kaggle" />
 </p>
 
-An end-to-end, production-grade streaming data engineering pipeline that ingests historical US stock market data from Kaggle, replays it as a real-time event stream through Apache Kafka, processes and validates events with Apache Spark Structured Streaming, stores clean Parquet files in MinIO (S3-compatible), runs SparkSQL analytics into PostgreSQL, orchestrates the full workflow via Apache Airflow, visualises results in Power BI, and surfaces predictions and RAG-powered Q&A through a Streamlit application — all containerised with Docker Compose.
+<p><sub><b>STREAMING &amp; PROCESSING</b></sub></p>
+<p>
+  <img src="https://img.shields.io/badge/Apache%20Kafka-231F20?style=for-the-badge&logo=apachekafka&logoColor=white" alt="Apache Kafka" />
+  <img src="https://img.shields.io/badge/Apache%20Spark-E25A1C?style=for-the-badge&logo=apachespark&logoColor=white" alt="Apache Spark" />
+  <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
+</p>
+
+<p><sub><b>STORAGE &amp; ANALYTICS</b></sub></p>
+<p>
+  <img src="https://img.shields.io/badge/MinIO-C72E49?style=for-the-badge&logo=minio&logoColor=white" alt="MinIO" />
+  <img src="https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white" alt="PostgreSQL" />
+  <img src="https://img.shields.io/badge/pgAdmin%204-326690?style=for-the-badge&logo=pgadmin&logoColor=white" alt="pgAdmin 4" />
+</p>
+
+<p><sub><b>MACHINE LEARNING &amp; AI</b></sub></p>
+<p>
+  <img src="https://img.shields.io/badge/scikit--learn-F7931E?style=for-the-badge&logo=scikitlearn&logoColor=white" alt="scikit-learn" />
+  <img src="https://img.shields.io/badge/XGBoost-1A73E8?style=for-the-badge&logo=xgboost&logoColor=white" alt="XGBoost" />
+  <img src="https://img.shields.io/badge/PyTorch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white" alt="PyTorch" />
+  <img src="https://img.shields.io/badge/ChromaDB-FF6B6B?style=for-the-badge&logo=chromadb&logoColor=white" alt="ChromaDB" />
+  <img src="https://img.shields.io/badge/Groq-F55036?style=for-the-badge&logo=groq&logoColor=white" alt="Groq" />
+  <img src="https://img.shields.io/badge/Sentence%20Transformers-FF9D00?style=for-the-badge" alt="Sentence Transformers" />
+</p>
+
+<p><sub><b>APPLICATION &amp; BI</b></sub></p>
+<p>
+  <img src="https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white" alt="Streamlit" />
+  <img src="https://img.shields.io/badge/Power%20BI-F2C811?style=for-the-badge&logo=powerbi&logoColor=black" alt="Power BI" />
+</p>
+
+<p><sub><b>ORCHESTRATION &amp; INFRASTRUCTURE</b></sub></p>
+<p>
+  <img src="https://img.shields.io/badge/Apache%20Airflow-017CEE?style=for-the-badge&logo=apacheairflow&logoColor=white" alt="Apache Airflow" />
+  <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" />
+</p>
+
+<br/>
+
+<p>
+  <img src="https://img.shields.io/badge/Milestones-6-2E9BFF?style=flat-square" alt="6 Milestones" />
+  <img src="https://img.shields.io/badge/Tickers-6%2C600%2B-20BEFF?style=flat-square" alt="6,600+ Tickers" />
+  <img src="https://img.shields.io/badge/Throughput-10%2C000_rows%2Fs-231F20?style=flat-square" alt="10,000 rows/s" />
+  <img src="https://img.shields.io/badge/Kafka_Brokers-3_(KRaft)-E25A1C?style=flat-square" alt="3 Brokers" />
+  <img src="https://img.shields.io/badge/Analytics_Tables-10-4169E1?style=flat-square" alt="10 Tables" />
+  <img src="https://img.shields.io/badge/PostgreSQL_Views-8-336791?style=flat-square" alt="8 Views" />
+  <img src="https://img.shields.io/badge/ML_Models-6_per_Ticker-FF3621?style=flat-square" alt="6 ML Models" />
+  <img src="https://img.shields.io/badge/Services-8_Containerised-2496ED?style=flat-square" alt="8 Services" />
+</p>
+
+<br/>
+
+<p>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/Quick_Start-2E9BFF?style=for-the-badge" alt="Quick Start" /></a>
+  <a href="#architecture"><img src="https://img.shields.io/badge/Architecture-017CEE?style=for-the-badge" alt="Architecture" /></a>
+  <a href="#service-urls"><img src="https://img.shields.io/badge/Service_URLs-009688?style=for-the-badge" alt="Service URLs" /></a>
+  <a href="#troubleshooting"><img src="https://img.shields.io/badge/Troubleshooting-E25A1C?style=for-the-badge" alt="Troubleshooting" /></a>
+  <a href="#toc"><img src="https://img.shields.io/badge/Table_of_Contents-455A64?style=for-the-badge" alt="Table of Contents" /></a>
+</p>
+
+<br/>
+
+<blockquote>
+<strong>Real-Time US Stocks Data Pipeline</strong> is an end-to-end, production-grade streaming data engineering pipeline that ingests historical US stock market data from Kaggle, replays it as a real-time event stream through Apache Kafka, processes and validates events with Apache Spark Structured Streaming, stores clean Parquet files in MinIO (S3-compatible), runs SparkSQL analytics into PostgreSQL, orchestrates the full workflow via Apache Airflow, visualises results in Power BI, and surfaces predictions and RAG-powered Q&amp;A through a Streamlit application — all containerised with Docker Compose.
+</blockquote>
+
+</div>
+
+<br/>
 
 ---
 
-## Table of Contents
+<div align="left">
 
-- [Architecture](#architecture)
-- [Project Objectives](#project-objectives)
-- [Key Features](#key-features)
-- [Technology Stack](#technology-stack)
-- [Data Source](#data-source)
-- [End-to-End Pipeline](#end-to-end-pipeline)
-  - [M1 — Data Ingestion & Kafka](#m1--data-ingestion--kafka)
-  - [M2 — Spark Structured Streaming](#m2--spark-structured-streaming)
-  - [M3 — SparkSQL Analytics](#m3--sparksql-analytics)
-  - [M4 — Airflow Orchestration](#m4--airflow-orchestration)
-  - [M5 — Machine Learning](#m5--machine-learning)
-  - [M6 — RAG Assistant & Streamlit App](#m6--rag-assistant--streamlit-app)
-- [Service URLs](#service-urls)
-- [Project Structure](#project-structure)
-- [Prerequisites](#prerequisites)
-- [Environment Configuration](#environment-configuration)
-- [Installation](#installation)
-- [Running the End-to-End Pipeline](#running-the-end-to-end-pipeline)
-- [Verification & Testing](#verification--testing)
-- [Monitoring & Observability](#monitoring--observability)
-- [Data Quality](#data-quality)
-- [Pipeline Design Decisions](#pipeline-design-decisions)
-- [Scalability & Production Considerations](#scalability--production-considerations)
-- [Troubleshooting](#troubleshooting)
-- [Security](#security)
-- [Future Improvements](#future-improvements)
-- [Quick Start](#quick-start)
+<a id="toc"></a>
+
+## 📌 Table of Contents
+
+| Section | Section |
+|---|---|
+| [🎯 Project Overview](#-project-overview) | [🏗 Architecture](#-architecture) |
+| [💡 Project Objectives](#-project-objectives) | [⚡ Key Features](#-key-features) |
+| [🛠 Technology Stack](#-technology-stack) | [📦 Data Source](#-data-source) |
+| [🔄 End-to-End Pipeline](#-end-to-end-pipeline) | [🌐 Service URLs](#-service-urls) |
+| [📁 Project Structure](#-project-structure) | [✅ Prerequisites](#-prerequisites) |
+| [🔧 Environment Configuration](#-environment-configuration) | [⚙️ Installation](#️-installation) |
+| [🚀 Running the Pipeline](#-running-the-end-to-end-pipeline) | [🧪 Verification & Testing](#-verification--testing) |
+| [📊 Monitoring & Observability](#-monitoring--observability) | [🧹 Data Quality](#-data-quality) |
+| [🧠 Design Decisions](#-pipeline-design-decisions) | [📈 Scalability](#-scalability--production-considerations) |
+| [🩺 Troubleshooting](#-troubleshooting) | [🔐 Security](#-security) |
+| [🔭 Future Improvements](#-future-improvements) | [⚡ Quick Start](#-quick-start) |
 
 ---
 
-## Architecture
+# 🎯 Project Overview
 
-The pipeline is structured as six sequential milestones (M1–M6), each building on the output of the previous stage.
+> **Real-Time US Stocks Data Pipeline** is a production-grade data engineering and AI platform that connects historical market data, real-time event streaming, distributed processing, analytical warehousing, machine learning, business intelligence, and retrieval-augmented generation in one reproducible Docker-based environment.
+
+The solution is organized into six sequential milestones:
+
+| Layer | Description |
+|---|---|
+| **M1 — Data Ingestion & Kafka** | Replays Kaggle stock CSVs as real-time JSON events through a 3-broker KRaft Kafka cluster. |
+| **M2 — Spark Structured Streaming** | Validates events, routes bad records to a dead-letter topic, and stores clean + aggregated Parquet data in MinIO. |
+| **M3 — SparkSQL Analytics** | Runs 10 analytical workloads and writes results into PostgreSQL, with indexes and Power BI-ready views. |
+| **M4 — Airflow Orchestration** | Automates health checks, streaming, analytics, post-processing, and validation every 7 minutes. |
+| **M5 — Machine Learning** | Trains per-ticker models for 5-day forward-return prediction using chronological splits and walk-forward validation. |
+| **M6 — RAG Assistant & Streamlit** | Combines ChromaDB, Sentence Transformers, Groq, saved ML models, and Streamlit for Q&A, prediction, and model-performance exploration. |
+
+The complete system is reproducible through Docker Compose and exposes local operational interfaces for Kafka, Spark, MinIO, PostgreSQL, pgAdmin, Airflow, and Streamlit.
+
+<p align="right"><a href="#top">↑ back to top</a></p>
+
+---
+
+# 🏗 Architecture
+
+### System Architecture — End to End
 
 ```mermaid
 flowchart TD
@@ -120,7 +210,7 @@ flowchart TD
 
 ### Data Flow Summary
 
-```
+```text
 Kaggle (6,600+ CSVs)
   ↓  producer.py — Kaggle API → JSON events → Kafka
 Apache Kafka (3-broker KRaft cluster)
@@ -133,9 +223,11 @@ PostgreSQL (stocks_analytics DB — 10 tables, 8 views)
   ↓  Streamlit + ChromaDB + Groq — RAG chat + predictions
 ```
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Project Objectives
+# 💡 Project Objectives
 
 | Objective | Implementation |
 |---|---|
@@ -148,26 +240,41 @@ PostgreSQL (stocks_analytics DB — 10 tables, 8 views)
 | AI-powered Q&A | RAG assistant grounded in a ChromaDB vector store of historical stock data |
 | Reproducibility | Fully Dockerised — single `docker compose up` starts every service |
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Key Features
+# ⚡ Key Features
+
+### 📡 Streaming & Reliability
 
 - **High-throughput Kafka producer** — streams up to 10,000 rows/second from 6,600+ Kaggle CSVs; handles 404s from missing tickers without retrying
 - **3-broker KRaft Kafka cluster** — no ZooKeeper, replication factor 3, `min.insync.replicas=2`
 - **Spark Structured Streaming** with three simultaneous sinks: clean Parquet, windowed aggregations, dead-letter Kafka topic
 - **Idempotent Parquet merges** — `dropDuplicates(["event_id"])` ensures safe re-runs and Kafka replays
 - **MinIO as HDFS replacement** — S3-compatible, persistent, browsable via web UI
+
+### 📊 Analytics & Orchestration
+
 - **10 SparkSQL analytics tables** — stock summary, price volatility, monthly/yearly performance, top performers, volume leaders, dividends, stochastic signals, market breadth, streaming windows
 - **8 PostgreSQL views** — pre-built for Power BI consumption
 - **Airflow DAG** — 7-minute cadence, 8 tasks, preflight environment checks, SLA monitoring
+
+### 🤖 Machine Learning & RAG
+
 - **6 ML models per ticker** — Naive, Ridge, Huber, RandomForest, HistGradientBoosting, XGBoost, LSTM; auto-selects best by RMSE
 - **RAG chat assistant** — ChromaDB + `all-MiniLM-L6-v2` + Groq LLM; ticker-aware retrieval
 - **Streamlit app** — three tabs: RAG Chat, ML Prediction, ML Performance dashboard
+
+### 🐳 Reproducibility
+
 - **Fully containerised** — Docker Compose with health checks and dependency ordering
+
+<p align="right"><a href="#top">↑ back to top</a></p>
 
 ---
 
-## Technology Stack
+# 🛠 Technology Stack
 
 | Layer | Technology | Version | Purpose |
 |---|---|---|---|
@@ -190,9 +297,11 @@ PostgreSQL (stocks_analytics DB — 10 tables, 8 views)
 | Infrastructure | Docker + Docker Compose | v24+ | Container orchestration |
 | Language | Python | 3.11 | All pipeline scripts |
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Data Source
+# 📦 Data Source
 
 | Property | Value |
 |---|---|
@@ -208,11 +317,13 @@ PostgreSQL (stocks_analytics DB — 10 tables, 8 views)
 
 **Why this dataset?** It provides decades of OHLCV history across thousands of US tickers in a consistent format, making it ideal for demonstrating a complete streaming + analytics + ML pipeline at realistic scale.
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## End-to-End Pipeline
+# 🔄 End-to-End Pipeline
 
-### M1 — Data Ingestion & Kafka
+## M1 — Data Ingestion & Kafka
 
 **Script:** `kafka/producer.py`  
 **Validator:** `kafka/consumer.py`  
@@ -224,7 +335,7 @@ The producer reads ticker symbols from `kafka/Stock_List.csv`, builds Kaggle fil
 
 **404 handling:** Tickers in `Stock_List.csv` that have no matching CSV in the Kaggle dataset are skipped immediately on a 404 — no retries, no backoff. This was a bug fix applied on 2026-09-09.
 
-**Canonical event schema:**
+### Canonical Event Schema
 
 ```json
 {
@@ -245,7 +356,7 @@ The producer reads ticker symbols from `kafka/Stock_List.csv`, builds Kaggle fil
 }
 ```
 
-**Kafka topic configuration:**
+### Kafka Topic Configuration
 
 | Topic | Partitions | Replication | Retention | Use |
 |---|---|---|---|---|
@@ -256,41 +367,47 @@ The M1 validation consumer (`consumer.py`) runs in a separate consumer group (`m
 
 ---
 
-### M2 — Spark Structured Streaming
+## M2 — Spark Structured Streaming
 
 **Script:** `spark/streaming_job.py`  
 **Container:** `stocks-spark` + `stocks-spark-worker`
 
-Reads from `us-stocks-raw` (starting offset: `earliest`), applies the 14-field `StructType` schema via `from_json`, adds an `is_valid` flag based on null checks and range guards, and fans out to three simultaneous sinks:
+Reads from `us-stocks-raw` (starting offset: `earliest`), applies the 14-field `StructType` schema via `from_json`, adds an `is_valid` flag based on null checks and range guards, and fans out to three simultaneous sinks.
 
-**Sink 1 — Clean Parquet (MinIO):** `foreachBatch` trigger every 30 seconds. For each batch, collects distinct tickers, reads the existing per-ticker Parquet (if any), unions with new rows, deduplicates on `event_id`, sorts by `date`/`event_id`, and writes back with `mode("overwrite")` + `partitionBy("ticker")`. A single Spark job handles all tickers per batch.
+### Sink 1 — Clean Parquet (MinIO)
 
-```
+`foreachBatch` trigger every 30 seconds. For each batch, collects distinct tickers, reads the existing per-ticker Parquet (if any), unions with new rows, deduplicates on `event_id`, sorts by `date`/`event_id`, and writes back with `mode("overwrite")` + `partitionBy("ticker")`. A single Spark job handles all tickers per batch.
+
+```text
 s3a://stocks/clean/ticker=AAPL/part-00000-<uuid>.snappy.parquet
 s3a://stocks/clean/ticker=MSFT/part-00000-<uuid>.snappy.parquet
 ...
 ```
 
-**Sink 2 — Windowed Aggregations (MinIO):** 1-minute tumbling windows on `kafka_timestamp` with a 2-minute watermark. Writes `avg_close`, `total_volume`, `event_count` partitioned by `window_date`.
+### Sink 2 — Windowed Aggregations (MinIO)
 
-```
+1-minute tumbling windows on `kafka_timestamp` with a 2-minute watermark. Writes `avg_close`, `total_volume`, `event_count` partitioned by `window_date`.
+
+```text
 s3a://stocks/aggregated/window_date=2024-01-15/part-*.snappy.parquet
 ```
 
-**Sink 3 — Dead-Letter (Kafka):** Invalid events are serialised back to JSON and published to `us-stocks-dead-letter`.
+### Sink 3 — Dead-Letter (Kafka)
+
+Invalid events are serialised back to JSON and published to `us-stocks-dead-letter`.
 
 All three checkpoint locations live in MinIO (`s3a://stocks/checkpoints/`), enabling fault recovery across container restarts.
 
-**Key bug fix (2026-09-11):** `merged.count()` was moved to _before_ the Parquet overwrite. The old code triggered a re-execution of the lazy plan against an already-deleted file, causing `SparkFileNotFoundException`.
+> **Key bug fix (2026-09-11):** `merged.count()` was moved to _before_ the Parquet overwrite. The old code triggered a re-execution of the lazy plan against an already-deleted file, causing `SparkFileNotFoundException`.
 
 ---
 
-### M3 — SparkSQL Analytics
+## M3 — SparkSQL Analytics
 
 **Script:** `spark/analytics_job.py` (authoritative version in `spark/` directory)  
 **Post-processing:** `spark/post_analytics.sql`
 
-A batch Spark job that reads all clean Parquet from MinIO with `spark.read.schema(CLEAN_SCHEMA).parquet(S3_CLEAN)` (explicit schema avoids Parquet footer reads and handles missing files gracefully), registers a temp view `stocks`, then runs 10 SparkSQL queries:
+A batch Spark job that reads all clean Parquet from MinIO with `spark.read.schema(CLEAN_SCHEMA).parquet(S3_CLEAN)` (explicit schema avoids Parquet footer reads and handles missing files gracefully), registers a temp view `stocks`, then runs 10 SparkSQL queries.
 
 | # | Table | Key Metrics |
 |---|---|---|
@@ -307,7 +424,7 @@ A batch Spark job that reads all clean Parquet from MinIO with `spark.read.schem
 
 Results are written via JDBC (`mode=overwrite`). Because `mode=overwrite` drops and recreates tables (which would break views), `analytics_job.py` first drops all 8 views from `post_analytics.sql` via JDBC before writing, then `post_analytics.sql` recreates them.
 
-**Post-analytics SQL** creates 17+ indexes and 8 views:
+### PostgreSQL Views
 
 | View | Description |
 |---|---|
@@ -324,7 +441,7 @@ Results are written via JDBC (`mode=overwrite`). Because `mode=overwrite` drops 
 
 ---
 
-### M4 — Airflow Orchestration
+## M4 — Airflow Orchestration
 
 **DAG file:** `dags/stock_pipeline_dag.py`  
 **DAG ID:** `stock_analytics_pipeline`  
@@ -333,7 +450,7 @@ Results are written via JDBC (`mode=overwrite`). Because `mode=overwrite` drops 
 
 The DAG orchestrates the full M1→M3 pipeline in a single run by exec-ing into already-running Docker containers (Docker-out-of-Docker via `/var/run/docker.sock`):
 
-```
+```text
 check_setup_preflight
   ├── check_kafka_health ──┐
   └── check_postgres_health ┘
@@ -355,7 +472,7 @@ The `run_spark_streaming_job` task wraps `streaming_job.py` in a `timeout 180s` 
 
 ---
 
-### M5 — Machine Learning
+## M5 — Machine Learning
 
 **Script:** `Machine Learning/stock_return_pipeline.py`  
 **Streamlit module:** `Streamlit App/prediction.py`
@@ -377,29 +494,38 @@ The currently saved models are under `Streamlit App/models/Huber/` — Huber reg
 
 ---
 
-### M6 — RAG Assistant & Streamlit App
+## M6 — RAG Assistant & Streamlit App
 
 **App:** `Streamlit App/app.py`  
 **RAG logic:** `Streamlit App/rag_chat.py`  
 **Prediction:** `Streamlit App/prediction.py`  
 **Vector DB build:** `RAG/src/build_vector_db.py`
 
-The Streamlit application provides three tabs:
+The Streamlit application provides three tabs.
 
-**💬 Chat / RAG** — the user asks any natural-language question about stock data. The system:
+### 💬 Chat / RAG
+
+The user asks any natural-language question about stock data. The system:
+
 - Detects a ticker symbol from the question (regex + ignore-list)
 - Embeds the query with `all-MiniLM-L6-v2`
 - Queries ChromaDB with optional ticker filter (`where: {ticker: "AAPL"}`)
 - Sends retrieved chunks + question to Groq (`openai/gpt-oss-20b`)
 - Returns a grounded answer with sources
 
-**🤖 ML Prediction** — loads the saved `.joblib` model for the selected ticker, fetches the last 20 trading days from ChromaDB, applies the training scaler, and predicts the 5-day return and implied future price.
+### 🤖 ML Prediction
 
-**📊 ML Performance** — reads `metrics_all_models.csv` and `walk_forward.csv`, displays median RMSE/MAE/DirAcc across all tickers per model, per-ticker breakdowns, and walk-forward charts.
+Loads the saved `.joblib` model for the selected ticker, fetches the last 20 trading days from ChromaDB, applies the training scaler, and predicts the 5-day return and implied future price.
+
+### 📊 ML Performance
+
+Reads `metrics_all_models.csv` and `walk_forward.csv`, displays median RMSE/MAE/DirAcc across all tickers per model, per-ticker breakdowns, and walk-forward charts.
+
+<p align="right"><a href="#top">↑ back to top</a></p>
 
 ---
 
-## Service URLs
+# 🌐 Service URLs
 
 All URLs are for local development. Start the full stack with `docker compose up -d` first.
 
@@ -414,9 +540,11 @@ All URLs are for local development. Start the full stack with `docker compose up
 | **PostgreSQL** | `localhost:5432` | `stocks` / `stocks123` / db `stocks_analytics` | Direct JDBC connection |
 | **Streamlit App** | http://localhost:8501 | None | RAG chat, ML prediction, performance |
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Project Structure
+# 📁 Project Structure
 
 ```text
 .
@@ -493,9 +621,11 @@ All URLs are for local development. Start the full stack with `docker compose up
 └── README.md                       # This file
 ```
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Prerequisites
+# ✅ Prerequisites
 
 | Requirement | Version | Notes |
 |---|---|---|
@@ -511,9 +641,11 @@ All URLs are for local development. Start the full stack with `docker compose up
 
 `5050` (pgAdmin), `5432` (PostgreSQL), `7077` (Spark), `8080` (Kafka UI), `8081` (Spark UI), `8082` (Airflow), `9000` (MinIO API), `9001` (MinIO console), `9092`, `9093`, `9094` (Kafka brokers)
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Environment Configuration
+# 🔧 Environment Configuration
 
 Copy `env.example` to `.env` in the repository root and fill in your values:
 
@@ -561,11 +693,13 @@ For the Streamlit RAG app, create `Streamlit App/.env`:
 GROQ_API_KEY=your_groq_api_key
 ```
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Installation
+# ⚙️ Installation
 
-### Step 1 — Clone the repository
+## 1 — Clone the Repository
 
 ```bash
 git lfs install          # required for the .pbix file
@@ -573,24 +707,26 @@ git clone <your-repo-url>
 cd <repo-directory>
 ```
 
-### Step 2 — Configure environment
+## 2 — Configure Environment
 
 ```bash
 cp env.example .env
 # Edit .env — add KAGGLE_USERNAME and KAGGLE_KEY at minimum
 ```
 
-### Step 3 — Build Docker images
+## 3 — Build Docker Images
 
 ```bash
 docker compose build
 ```
 
 This builds two custom images:
+
 - `Dockerfile.python` — Python 3.11 image for the producer and consumer
 - `spark/Dockerfile` — Spark 3.5.7 with all required JARs pre-baked (Kafka connector, S3A, PostgreSQL JDBC)
 
 And pulls:
+
 - `confluentinc/cp-kafka:7.6.1` — 3 broker instances
 - `elestio/minio:latest` — MinIO object store
 - `postgres:16` — analytics database
@@ -598,7 +734,7 @@ And pulls:
 - `apache/airflow:2.10.4-python3.11` — Airflow (custom image built on top)
 - `ghcr.io/kafbat/kafka-ui:latest` — Kafka UI
 
-### Step 4 — Start the full infrastructure
+## 4 — Start the Full Infrastructure
 
 ```bash
 docker compose up -d
@@ -606,7 +742,7 @@ docker compose up -d
 
 Wait approximately 60–90 seconds for KRaft leader election and all health checks to pass.
 
-### Step 5 — Verify all services are healthy
+## 5 — Verify Services
 
 ```bash
 docker compose ps
@@ -614,7 +750,7 @@ docker compose ps
 
 Expected output:
 
-```
+```text
 NAME                    STATUS          PORTS
 kafka-1                 healthy         0.0.0.0:9092->9092/tcp
 kafka-2                 healthy         0.0.0.0:9093->9093/tcp
@@ -636,15 +772,17 @@ airflow-postgres        healthy
 
 Both `kafka-init` and `stocks-minio-init` must show `exited (0)`. Any other exit code indicates a failure — check logs with `docker compose logs kafka-init`.
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Running the End-to-End Pipeline
+# 🚀 Running the End-to-End Pipeline
 
-The pipeline can be run manually (steps below) or automatically via Airflow after unpausing the DAG.
+The pipeline can be run manually or automatically via Airflow after unpausing the DAG.
 
-### Manual Execution Order
+## Manual Execution Order
 
-#### Step 1 — Verify data is flowing into Kafka
+### Step 1 — Verify Data Is Flowing into Kafka
 
 ```bash
 docker compose logs --tail=20 producer
@@ -652,10 +790,11 @@ docker compose logs --tail=20 producer
 
 Look for lines like `sent= 50/9876 ( 0.5%) total=50`. Also confirm at http://localhost:8080 → Topics → `us-stocks-raw` → Messages.
 
-#### Step 2 — Run Spark Structured Streaming (M2)
+### Step 2 — Run Spark Structured Streaming (M2)
+
+**Windows PowerShell**
 
 ```powershell
-# Windows PowerShell
 docker exec -it stocks-spark `
   /opt/spark/bin/spark-submit `
     --master spark://stocks-spark:7077 `
@@ -663,8 +802,9 @@ docker exec -it stocks-spark `
     /opt/spark/work-dir/streaming_job.py
 ```
 
+**Linux / macOS**
+
 ```bash
-# Linux / macOS
 docker exec -it stocks-spark \
   /opt/spark/bin/spark-submit \
     --master spark://stocks-spark:7077 \
@@ -674,7 +814,7 @@ docker exec -it stocks-spark \
 
 Let this run for **at least 5 minutes** before proceeding. Verify Parquet files at http://localhost:9001 → Buckets → stocks → clean.
 
-#### Step 3 — Run SparkSQL Analytics (M3)
+### Step 3 — Run SparkSQL Analytics (M3)
 
 ```powershell
 docker exec -it stocks-spark `
@@ -691,14 +831,15 @@ docker exec -it stocks-spark `
 ```
 
 Expected output ends with:
-```
+
+```text
 ✓  Stock Summary         → table=stock_summary         rows=...
 ...
 ✓  Daily Market Breadth  → table=daily_market_breadth   rows=...
 Analytics complete in ~40s
 ```
 
-#### Step 4 — Apply indexes and views
+### Step 4 — Apply Indexes and Views
 
 ```powershell
 docker cp spark/post_analytics.sql stocks-postgres:/tmp/post_analytics.sql
@@ -706,7 +847,7 @@ docker exec -i stocks-postgres psql -U stocks -d stocks_analytics `
   -f /tmp/post_analytics.sql
 ```
 
-#### Step 5 — Verify PostgreSQL output
+### Step 5 — Verify PostgreSQL Output
 
 ```bash
 docker exec -it stocks-postgres psql -U stocks -d stocks_analytics -c "
@@ -714,7 +855,7 @@ SELECT tablename, pg_size_pretty(pg_total_relation_size(tablename::text)) AS siz
 FROM pg_tables WHERE schemaname = 'public' ORDER BY pg_total_relation_size(tablename::text) DESC;"
 ```
 
-#### Step 6 — (Optional) Bulk load raw Kaggle data
+### Step 6 — Optional: Bulk Load Raw Kaggle Data
 
 This loads every ticker CSV directly into `stocks_raw` for Power BI historical dashboards:
 
@@ -735,18 +876,18 @@ docker exec -it stocks-spark bash -c \
    --workers 4 --chunk 50000 --drop"
 ```
 
-### Automated Execution via Airflow
+## Automated Execution via Airflow
 
 1. Open http://localhost:8082 and log in
 2. Find the `stock_analytics_pipeline` DAG and toggle it **on** (unpause)
 3. The DAG runs every 7 minutes automatically
-4. To trigger immediately: click the ▶️ button or run:
+4. To trigger immediately, click the ▶️ button or run:
 
 ```bash
 docker exec -it airflow-webserver airflow dags trigger stock_analytics_pipeline
 ```
 
-### Running the Streamlit Application
+## Running the Streamlit Application
 
 ```bash
 cd "Streamlit App"
@@ -756,11 +897,13 @@ streamlit run app.py
 
 The app opens at http://localhost:8501. Requires `chroma_db/` and `models/Huber/` to be present.
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Verification & Testing
+# 🧪 Verification & Testing
 
-### Kafka — confirm events are flowing
+## Kafka — Confirm Events Are Flowing
 
 ```bash
 # Producer logs
@@ -773,7 +916,7 @@ docker compose logs --tail=30 consumer
 # http://localhost:8080 → Topics → us-stocks-raw
 ```
 
-### MinIO — confirm Parquet files exist
+## MinIO — Confirm Parquet Files Exist
 
 ```bash
 docker exec -it stocks-minio-init bash -c \
@@ -781,7 +924,7 @@ docker exec -it stocks-minio-init bash -c \
    mc ls --recursive local/stocks/clean/ | head -20"
 ```
 
-### PostgreSQL — row counts for all tables
+## PostgreSQL — Row Counts for All Tables
 
 ```bash
 docker exec -it stocks-postgres psql -U stocks -d stocks_analytics -c "
@@ -797,22 +940,24 @@ SELECT 'daily_market_breadth',             COUNT(*) FROM daily_market_breadth   
 SELECT 'streaming_window_summary',         COUNT(*) FROM streaming_window_summary;"
 ```
 
-### Airflow — check DAG status
+## Airflow — Check DAG Status
 
 ```bash
 docker exec -it airflow-webserver airflow dags list-runs -d stock_analytics_pipeline
 ```
 
-### Spark — top performers sample
+## Spark — Top Performers Sample
 
 ```bash
 docker exec -it stocks-postgres psql -U stocks -d stocks_analytics -c \
   "SELECT ticker, pct_change, direction FROM top_performers ORDER BY pct_change DESC LIMIT 10;"
 ```
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Monitoring & Observability
+# 📊 Monitoring & Observability
 
 | Tool | URL | What to Monitor |
 |---|---|---|
@@ -822,7 +967,7 @@ docker exec -it stocks-postgres psql -U stocks -d stocks_analytics -c \
 | **Airflow UI** | http://localhost:8082 | DAG run history, task duration, SLA misses, task logs |
 | **pgAdmin** | http://localhost:5050 | Table sizes, query execution, index usage |
 
-### Log commands
+### Log Commands
 
 ```bash
 docker compose logs -f producer        # Kafka producer (download + produce rates)
@@ -833,9 +978,11 @@ docker compose logs kafka-init         # Topic creation (should end with "Topics
 docker compose logs minio-init         # Bucket creation (should end with "Bucket stocks is ready.")
 ```
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Data Quality
+# 🧹 Data Quality
 
 The following validation rules are enforced by `streaming_job.py` (Spark, real-time) and `consumer.py` (Python, M1):
 
@@ -854,36 +1001,47 @@ The following validation rules are enforced by `streaming_job.py` (Spark, real-t
 
 Invalid events are published to `us-stocks-dead-letter` with a 30-day retention for investigation and reprocessing.
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Pipeline Design Decisions
+# 🧠 Pipeline Design Decisions
 
-**Why MinIO instead of HDFS?**  
+### Why MinIO Instead of HDFS?
+
 MinIO provides an S3-compatible API that Spark's S3A connector understands natively. It eliminates the complexity of an HDFS cluster (NameNode, DataNode, journaling) while providing persistent, browsable storage via a web UI. All Spark checkpoints and Parquet files survive container restarts through a named Docker volume.
 
-**Why `foreachBatch` instead of a native Parquet sink?**  
+### Why `foreachBatch` Instead of a Native Parquet Sink?
+
 Spark's native Parquet streaming sink creates time-partitioned directories (`year=YYYY/month=MM/...`) which leads to thousands of small files across many partitions. `foreachBatch` with a merge-and-overwrite strategy produces one file per ticker, enabling efficient point queries and reducing metadata overhead.
 
-**Why `event_id` for deduplication instead of composite keys?**  
+### Why `event_id` for Deduplication Instead of Composite Keys?
+
 The producer assigns monotonically increasing `event_id` values. Deduplicating on `event_id` is O(n) and avoids the complexity of composite key deduplication across `(ticker, date)`, where the same (ticker, date) can legitimately appear in multiple Parquet files before merging.
 
-**Why KRaft (no ZooKeeper)?**  
+### Why KRaft (No ZooKeeper)?
+
 KRaft reduces operational complexity: fewer containers, no ZooKeeper coordination overhead, and a simpler cluster configuration. Confluent's `cp-kafka:7.6.1` image supports KRaft natively.
 
-**Why `mode=overwrite` in analytics_job.py?**  
+### Why `mode=overwrite` in `analytics_job.py`?
+
 The analytics job is designed to be idempotent — re-running it produces the same output as running it once. `mode=overwrite` guarantees a clean slate each run, avoiding stale rows from previous runs accumulating in analytics tables. The trade-off is that views must be dropped before each run (handled by `drop_views()` in `analytics_job.py`).
 
-**Why exec-into-container instead of DockerOperator in Airflow?**  
+### Why Exec into the Existing Spark Container from Airflow?
+
 `stocks-spark`, `stocks-minio`, and `stocks-postgres` are already running with all JARs, environment variables, and volume mounts configured. Exec-ing into these containers is equivalent to what a human would type at the terminal, and avoids duplicating Spark configuration (classpath, S3A JARs, environment) inside Airflow.
 
-**Why per-ticker saved models in M5?**  
+### Why Per-Ticker Saved Models in M5?
+
 Financial time series have heterogeneous characteristics across tickers (volatility, trend, liquidity). A single global model would underfit most tickers. Training a separate model per ticker allows the pipeline to capture ticker-specific dynamics, and the saved `.joblib` artifacts enable instant inference in the Streamlit app without retraining.
+
+<p align="right"><a href="#top">↑ back to top</a></p>
 
 ---
 
-## Scalability & Production Considerations
+# 📈 Scalability & Production Considerations
 
-### Currently Implemented
+## Currently Implemented
 
 - 3-broker Kafka cluster with replication factor 3 and `min.insync.replicas=2` — tolerates one broker failure
 - Spark checkpointing in MinIO — streaming job recovers from any crash by resuming from the last committed Kafka offset
@@ -891,7 +1049,7 @@ Financial time series have heterogeneous characteristics across tickers (volatil
 - `maxOffsetsPerTrigger=50000` in the streaming job — prevents OOM on first run when replaying millions of historical rows
 - `max_active_runs=1` in Airflow — prevents overlapping pipeline runs
 
-### Future Production Improvements
+## Future Production Improvements
 
 - **Cloud deployment**: migrate MinIO → AWS S3 (S3A endpoint change only), Kafka → MSK, PostgreSQL → RDS/Aurora, Spark → EMR or Databricks
 - **Schema registry**: add Confluent Schema Registry for Avro-based event schemas with versioning
@@ -903,9 +1061,11 @@ Financial time series have heterogeneous characteristics across tickers (volatil
 - **Data retention policies**: implement Parquet file compaction and archival for old MinIO data
 - **Horizontal Spark scaling**: add more `spark-worker` replicas; configure dynamic resource allocation
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Troubleshooting
+# 🩺 Troubleshooting
 
 | Problem | Fix |
 |---|---|
@@ -929,9 +1089,11 @@ Financial time series have heterogeneous characteristics across tickers (volatil
 | Streamlit: `ChromaDB directory not found` | Run `RAG/src/build_vector_db.py` to build the vector database first. |
 | `SparkFileNotFoundException` in streaming job | Fixed (2026-09-11) — `merged.count()` now runs before `write.mode("overwrite")`. If you see this, ensure you are running the latest `spark/streaming_job.py`. |
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Security
+# 🔐 Security
 
 - **Credentials**: all secrets are loaded from `.env` via `python-dotenv`. The `.env` file is listed in `.gitignore` and must never be committed.
 - **Default credentials**: the defaults in `env.example` are for local development only. Change `AIRFLOW_SECRET_KEY`, `POSTGRES_PASSWORD`, `MINIO_ACCESS_KEY`, and `MINIO_SECRET_KEY` before exposing any service outside localhost.
@@ -940,9 +1102,11 @@ Financial time series have heterogeneous characteristics across tickers (volatil
 - **Groq API key**: stored in `Streamlit App/.env`, loaded at runtime by the Streamlit app.
 - **Database authentication**: PostgreSQL uses `md5` authentication. The `stocks` user has full access to `stocks_analytics` only.
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Future Improvements
+# 🔭 Future Improvements
 
 - **Real-time data source**: replace the Kaggle replay with a live market data API (Alpaca, Polygon.io) for true real-time streaming
 - **dbt for transformations**: replace raw SparkSQL with dbt models for versioned, tested SQL transformations
@@ -954,9 +1118,11 @@ Financial time series have heterogeneous characteristics across tickers (volatil
 - **Cloud-native deployment**: migrate to Kubernetes (EKS/GKE) with Helm charts for each service component
 - **Streaming analytics directly to dashboard**: connect Spark streaming output directly to a real-time Power BI streaming dataset
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-## Quick Start
+# ⚡ Quick Start
 
 For experienced developers who want to run the full pipeline quickly on a machine with Docker Desktop, 8 GB RAM allocated, and a Kaggle API token ready:
 
@@ -1016,9 +1182,9 @@ docker exec -it airflow-webserver airflow dags unpause stock_analytics_pipeline
 
 ---
 
-## Data Flow Summary
+# 🔁 Data Flow Summary
 
-```
+```text
 Kaggle Dataset (footballjoe789/us-stock-dataset)
   ~6,200 CSVs, decades of OHLCV + stochastic indicators
            ↓
@@ -1048,3 +1214,19 @@ Power BI           ML Pipeline            RAG + Streamlit
 JDBC dashboard     Huber/LSTM models      ChromaDB + Groq
 historical charts  5-day predictions      natural language Q&A
 ```
+
+---
+
+<div align="center">
+
+## 📈 Real-Time US Stocks Data Pipeline
+
+**Streaming · Analytics · Machine Learning · RAG**
+
+Built around Kafka, Spark, MinIO, PostgreSQL, Airflow, Power BI, Streamlit, and Docker Compose.
+
+<br/>
+
+<a href="#top">↑ back to top</a>
+
+</div>
