@@ -95,6 +95,16 @@ combining Event Streaming · Distributed Processing · Analytical Warehousing ·
 
 ---
 
+## 🗺 Pipeline Architecture
+
+<p align="center">
+  <img src="Documents/Pipeline%20Diagram/FV%20Pipeline%20Diagram.png"
+       alt="Real-Time US Stocks Data Pipeline Architecture"
+       width="100%">
+</p>
+
+---
+
 <div align="left">
 
 <a id="toc"></a>
@@ -137,6 +147,8 @@ The complete system is reproducible through Docker Compose and exposes local ope
 <p align="right"><a href="#top">↑ back to top</a></p>
 
 ---
+
+<a id="architecture"></a>
 
 # 🏗 Architecture
 
@@ -492,6 +504,8 @@ The currently saved models are under `Streamlit App/models/Huber/` — Huber reg
 
 **Walk-forward validation** uses an expanding window (5 folds) with Huber regression to give a realistic view of out-of-sample performance over time.
 
+> **Note:** ML predictions represent a quantitative model output based on historical patterns. They are not financial advice and should not be used as the sole basis for investment decisions.
+
 ---
 
 ## M6 — RAG Assistant & Streamlit App
@@ -524,6 +538,8 @@ Reads `metrics_all_models.csv` and `walk_forward.csv`, displays median RMSE/MAE/
 <p align="right"><a href="#top">↑ back to top</a></p>
 
 ---
+
+<a id="service-urls"></a>
 
 # 🌐 Service URLs
 
@@ -607,6 +623,10 @@ All URLs are for local development. Start the full stack with `docker compose up
 ├── Power Bi/
 │   └── Dashboard_stocks.pbix       # Power BI dashboard (Git LFS, ~340 MB)
 │
+├── Documents/
+│   └── Pipeline Diagram/
+│       └── FV Pipeline Diagram.png # System architecture diagram
+│
 ├── backup_files/                   # Backup SQL files
 │
 ├── docker-compose.yml              # Full stack: Kafka + Spark + MinIO + Postgres + Airflow
@@ -618,7 +638,7 @@ All URLs are for local development. Start the full stack with `docker compose up
 ├── .gitignore
 ├── .gitattributes                  # LFS tracking for .pbix
 ├── PIPELINE_QUICKSTART.md          # Step-by-step manual run guide (PowerShell)
-└── README.md                       # This file
+└── README.md
 ```
 
 <p align="right"><a href="#top">↑ back to top</a></p>
@@ -703,8 +723,8 @@ GROQ_API_KEY=your_groq_api_key
 
 ```bash
 git lfs install          # required for the .pbix file
-git clone <your-repo-url>
-cd <repo-directory>
+git clone https://github.com/MohammedAhmed-01/Real-Time_US-Stocks_Data_Pipeline.git
+cd Real-Time_US-Stocks_Data_Pipeline
 ```
 
 ## 2 — Configure Environment
@@ -1058,14 +1078,17 @@ Financial time series have heterogeneous characteristics across tickers (volatil
 - **Data partitioning at scale**: partition PostgreSQL tables by date ranges for larger datasets
 - **CI/CD**: add GitHub Actions workflows for linting, unit tests, Docker image builds
 - **Monitoring**: add Prometheus + Grafana for Kafka consumer lag alerts and Spark executor metrics
-- **Data retention policies**: implement Parquet file compaction and archival for old MinIO data
-- **Horizontal Spark scaling**: add more `spark-worker` replicas; configure dynamic resource allocation
 
 <p align="right"><a href="#top">↑ back to top</a></p>
 
 ---
 
+<a id="troubleshooting"></a>
+
 # 🩺 Troubleshooting
+
+<details>
+<summary><strong>Click to expand full troubleshooting guide</strong></summary>
 
 | Problem | Fix |
 |---|---|
@@ -1074,20 +1097,22 @@ Financial time series have heterogeneous characteristics across tickers (volatil
 | Producer Kaggle auth error | Verify `KAGGLE_USERNAME` and `KAGGLE_KEY` in `.env`. Test: `kaggle datasets files footballjoe789/us-stock-dataset` |
 | Producer logs `not in dataset — skipping` for many tickers | Expected — some symbols in `Stock_List.csv` have no CSV in the Kaggle dataset. Not a bug. |
 | `Cannot read clean data from MinIO` in analytics job | Run `streaming_job.py` first and wait ≥5 minutes for Parquet to be written. |
-| `PSQLException: cannot drop table … other objects depend` | This is fixed in `spark/analytics_job.py` by calling `drop_views()` before writing. If you run `SparkSQL/analytics_job.py` (older version), use `spark/analytics_job.py` instead. |
-| `NUM_COLUMNS_MISMATCH` on Spark union | Fixed in `spark/analytics_job.py` — uses `spark.read.schema(CLEAN_SCHEMA).parquet(S3_CLEAN)` instead of manual per-ticker union. |
-| Views missing after analytics run | Run `post_analytics.sql` after every analytics job: `docker exec -i stocks-postgres psql -U stocks -d stocks_analytics -f /tmp/post_analytics.sql` |
+| `PSQLException: cannot drop table … other objects depend` | Fixed in `spark/analytics_job.py` by calling `drop_views()` before writing. Use `spark/analytics_job.py`, not `SparkSQL/analytics_job.py`. |
+| `NUM_COLUMNS_MISMATCH` on Spark union | Fixed in `spark/analytics_job.py` — uses `spark.read.schema(CLEAN_SCHEMA).parquet(S3_CLEAN)`. |
+| Views missing after analytics run | Run `post_analytics.sql` after every analytics job. |
 | `stocks_raw` table missing | Run Step 6 (bulk loader) — this table is not created by the streaming pipeline. |
-| Power BI can't connect | Install Npgsql `.msi` driver and **restart your PC** before opening Power BI. Use `localhost` not `postgres` as server. |
+| Power BI can't connect | Install Npgsql `.msi` driver and **restart your PC** before opening Power BI. Use `localhost`, not `postgres`, as server. |
 | pgAdmin can't reach postgres | Use host `postgres` (not `localhost`) in the pgAdmin server registration. |
 | Airflow DAG not appearing | Check `docker compose logs airflow-scheduler` for import errors. |
-| `check_minio_data` fails with "0 objects" | `streaming_job.py` window (`STREAMING_RUN_SECONDS=180`) was too short, or the producer isn't running. Raise `STREAMING_RUN_SECONDS` in `stock_pipeline_dag.py`. |
+| `check_minio_data` fails with "0 objects" | `streaming_job.py` window was too short, or the producer isn't running. Raise `STREAMING_RUN_SECONDS` in `stock_pipeline_dag.py`. |
 | Port already in use | Stop the conflicting service or change the host-side port in `docker-compose.yml`. |
 | Spark OOM / worker restarting | Allocate ≥8 GB RAM to Docker: Docker Desktop → Settings → Resources → Memory. |
-| `AttributeError: Can only use .dt accessor with datetimelike values` | Using old `bulk_load_to_postgres.py`. Replace with `PostgresSQL/bulk_load_to_postgres.py` which uses `utc=True` + `.dt.tz_localize(None).dt.date`. |
+| `AttributeError: Can only use .dt accessor with datetimelike values` | Replace with `PostgresSQL/bulk_load_to_postgres.py` which uses `utc=True` + `.dt.tz_localize(None).dt.date`. |
 | Streamlit: `FileNotFoundError: Model not found` | The `.joblib` model for that ticker was not trained. Check `models/Huber/` for available tickers. |
 | Streamlit: `ChromaDB directory not found` | Run `RAG/src/build_vector_db.py` to build the vector database first. |
-| `SparkFileNotFoundException` in streaming job | Fixed (2026-09-11) — `merged.count()` now runs before `write.mode("overwrite")`. If you see this, ensure you are running the latest `spark/streaming_job.py`. |
+| `SparkFileNotFoundException` in streaming job | Fixed (2026-09-11) — ensure you are running the latest `spark/streaming_job.py`. |
+
+</details>
 
 <p align="right"><a href="#top">↑ back to top</a></p>
 
@@ -1112,9 +1137,9 @@ Financial time series have heterogeneous characteristics across tickers (volatil
 - **dbt for transformations**: replace raw SparkSQL with dbt models for versioned, tested SQL transformations
 - **Great Expectations**: add automated data quality checks between pipeline stages
 - **MLflow**: track ML experiments, model versions, and metrics centrally instead of CSV files
-- **Feature store**: implement a feature store (Feast or Tecton) to share ML features between the training pipeline and the Streamlit inference app
+- **Feature store**: implement Feast or Tecton to share ML features between the training pipeline and the Streamlit inference app
 - **Model retraining automation**: add an Airflow task to retrain models when new data arrives and performance degrades
-- **Grafana dashboards**: add Prometheus exporters for Kafka, Spark, and PostgreSQL, with Grafana alerts for consumer lag and pipeline SLA misses
+- **Grafana dashboards**: add Prometheus exporters for Kafka, Spark, and PostgreSQL with Grafana alerts
 - **Cloud-native deployment**: migrate to Kubernetes (EKS/GKE) with Helm charts for each service component
 - **Streaming analytics directly to dashboard**: connect Spark streaming output directly to a real-time Power BI streaming dataset
 
@@ -1122,13 +1147,17 @@ Financial time series have heterogeneous characteristics across tickers (volatil
 
 ---
 
+<a id="quick-start"></a>
+
 # ⚡ Quick Start
 
-For experienced developers who want to run the full pipeline quickly on a machine with Docker Desktop, 8 GB RAM allocated, and a Kaggle API token ready:
+For experienced developers with Docker Desktop (8 GB RAM allocated) and a Kaggle API token ready:
 
 ```bash
 # 1. Clone and configure
-git lfs install && git clone <repo-url> && cd <repo-dir>
+git lfs install
+git clone https://github.com/MohammedAhmed-01/Real-Time_US-Stocks_Data_Pipeline.git
+cd Real-Time_US-Stocks_Data_Pipeline
 cp env.example .env
 # Edit .env — set KAGGLE_USERNAME and KAGGLE_KEY
 
@@ -1138,7 +1167,7 @@ docker compose build && docker compose up -d
 # 3. Wait ~90s for KRaft election, then verify
 docker compose ps   # all services should be healthy / running
 
-# 4. Run Spark Streaming (let it run for 5+ minutes in a separate terminal)
+# 4. Run Spark Streaming (let it run 5+ minutes in a separate terminal)
 docker exec -it stocks-spark /opt/spark/bin/spark-submit \
   --master spark://stocks-spark:7077 --conf spark.jars.ivy=/tmp/.ivy2 \
   /opt/spark/work-dir/streaming_job.py
@@ -1156,9 +1185,10 @@ docker exec -it stocks-spark /opt/spark/bin/spark-submit \
 
 # 6. Apply indexes and views
 docker cp spark/post_analytics.sql stocks-postgres:/tmp/post_analytics.sql
-docker exec -i stocks-postgres psql -U stocks -d stocks_analytics -f /tmp/post_analytics.sql
+docker exec -i stocks-postgres psql -U stocks -d stocks_analytics \
+  -f /tmp/post_analytics.sql
 
-# 7. Verify — check row counts in PostgreSQL
+# 7. Verify row counts in PostgreSQL
 docker exec -it stocks-postgres psql -U stocks -d stocks_analytics \
   -c "SELECT tablename, pg_size_pretty(pg_total_relation_size(tablename::text)) AS size \
       FROM pg_tables WHERE schemaname='public' ORDER BY 2 DESC;"
@@ -1172,17 +1202,16 @@ docker exec -it stocks-postgres psql -U stocks -d stocks_analytics \
 
 # 9. (Optional) Start the Streamlit app
 cd "Streamlit App" && pip install -r requirements.txt && streamlit run app.py
-```
 
-To hand the pipeline over to Airflow for automated runs:
-
-```bash
+# 10. (Optional) Hand off to Airflow for automated runs
 docker exec -it airflow-webserver airflow dags unpause stock_analytics_pipeline
 ```
 
+<p align="right"><a href="#top">↑ back to top</a></p>
+
 ---
 
-# 🔁 Data Flow Summary
+## 🔁 Complete Data Flow
 
 ```text
 Kaggle Dataset (footballjoe789/us-stock-dataset)
