@@ -34,3 +34,12 @@ psycopg2-binary==2.9.9
 
 # SQLAlchemy: optional — only needed if you use pandas .to_sql() instead of COPY
 # sqlalchemy==2.0.30
+
+# Streamlit application and RAG assistant
+chromadb==0.5.5
+sentence-transformers==3.0.1
+langchain==0.2.14
+langchain-groq==0.1.9
+langchain-community==0.2.12
+streamlit==1.38.0
+pandas==2.2.2
